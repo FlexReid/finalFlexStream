@@ -123,7 +123,7 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
     for attempt in range(1, retries + 1):
         debug(f"Playwright attempt {attempt} for {page_url}")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.webkit.launch()
             context = browser.new_context()
             page = context.new_page()
             captured = {"url": None}
@@ -845,5 +845,6 @@ def index():
 # ----------------------------
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+
 
 
