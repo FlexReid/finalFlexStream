@@ -289,19 +289,18 @@ def segment():
     u = request.args.get("u")
     if not u:
         return "Missing u param", 400
+
     url = unquote_plus(u)
     try:
         remote_bytes = fetch_bytes(url)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
 
-    ts_bytes = extract_ts_packets(remote_bytes)
-    if not ts_bytes:
-        return "No MPEG-TS data found in segment", 404
-
-    resp = Response(ts_bytes, mimetype="video/MP2T")
-    resp.headers['Content-Length'] = str(len(ts_bytes))
+    # Always pass raw bytes — this avoids random missing segments
+    resp = Response(remote_bytes, mimetype="video/MP2T")
+    resp.headers['Content-Length'] = str(len(remote_bytes))
     return resp
+
 
 # ----------------------------
 # Autocomplete endpoint
@@ -845,6 +844,7 @@ def index():
 # ----------------------------
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+
 
 
 
