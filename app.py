@@ -293,10 +293,10 @@ def segment():
     url = unquote_plus(u)
     try:
         remote_bytes = fetch_bytes(url)
+        remote_bytes = extract_ts_packets(remote_bytes)  # << FIX: align TS packets
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
 
-    # Always pass raw bytes — this avoids random missing segments
     resp = Response(remote_bytes, mimetype="video/MP2T")
     resp.headers['Content-Length'] = str(len(remote_bytes))
     return resp
