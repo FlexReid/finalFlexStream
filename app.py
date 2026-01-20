@@ -310,9 +310,28 @@ def autocomplete():
     query = request.args.get("q", "").strip()
     if not query:
         return jsonify([])
+
     results = search_tmdb(query)
-    names = [r["title"] if r["media_type"] == "movie" else r["name"] for r in results]
-    matches = [title for title, score, idx in process.extract(query, names, scorer=fuzz.token_sort_ratio, limit=5)]
+    suggestions = []
+    for r in results:
+        if r["media_type"] == "movie":
+            year = r.get("release_date", "")[:4]  # get year from release_date
+        else:  # tv
+            year = r.get("first_air_date", "")[:4]
+        display = f"{r['title'] if r['media_type'] == 'movie' else r['name']} ({year})" if year else r['title'] if r['media_type'] == 'movie' else r['name']
+        suggestions.append(display)
+
+    # Deduplicate suggestions ignoring case
+    seen = set()
+    unique_suggestions = []
+    for s in suggestions:
+        if s.lower() not in seen:
+            unique_suggestions.append(s)
+            seen.add(s.lower())
+
+    # Limit to top 5 matches using fuzzy search on just the title part
+    titles_only = [s.split(" (")[0] for s in unique_suggestions]
+    matches = [unique_suggestions[idx] for title, score, idx in process.extract(query, titles_only, scorer=fuzz.token_sort_ratio, limit=5)]
     return jsonify(matches)
 
 @app.route("/seasons")
@@ -483,34 +502,28 @@ footer {
   color: #888;
 }
 
-/* 🔹 Mobile-friendly adjustments */
+/* Mobile-friendly adjustments */
 @media (max-width: 768px) {
-
-  /* Stack controls vertically and make them full width */
   #controls {
       flex-direction: column;
       align-items: stretch;
       gap: 10px;
   }
-
   #controls input,
   #controls select,
   #controls button {
-      flex: none;          /* ignore previous flex-grow/shrink */
-      width: 100%;         /* full width for mobile */
-      max-width: 100%;     /* prevent shrinking */
-      box-sizing: border-box; 
+      flex: none;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
       text-align: center;
-      text-align-last: center; /* iOS fix */
-      color: #000;         /* fix blue text */
+      text-align-last: center;
+      color: #000;
   }
-
-  /* Video adjustments remain */
   #video-container {
       width: 98%;
       max-width: 100%;
   }
-
   #video-container video {
       width: 100%;
       height: 35vh;
@@ -520,83 +533,52 @@ footer {
       object-fit: contain;
       border-radius: 8px;
   }
-
-  /* Footer right below video */
   footer {
       margin-top: 10px;
       margin-bottom: 20px;
   }
-
-  /* Disable scrolling */
   html, body {
       overflow: hidden;
       touch-action: none;
       height: 100%;
   }
-
-/* 🔹 Make Load & Play button taller and narrower */
   #controls button {
-      width: 50%;      /* half the container width */
-      min-height: 60px; /* double previous 42px */
-      padding: 0;      /* optional: reduce padding since height increased */
-      align-self: center; /* center it horizontally */
-      font-size: 1.5rem; /* slightly bigger text for tall button */
+      width: 50%;
+      min-height: 60px;
+      padding: 0;
+      align-self: center;
+      font-size: 1.5rem;
   }
-
-/* Wrap the select in a relative container */
   #controls .select-wrapper {
       position: relative;
       width: 100%;
   }
-
   #controls select {
-      -webkit-appearance: none !important; /* removes default arrow on iOS */
-      appearance: none !important;         /* removes arrow on other browsers */
+      -webkit-appearance: none !important;
+      appearance: none !important;
       width: 100%;
-      padding: 10px;                        /* simple padding all around */
-      text-align: center;                    /* center the text */
-      text-align-last: center;               /* iOS fix for select text centering */
-      background: #e5e5e5;                  /* plain background */
+      padding: 10px;
+      text-align: center;
+      text-align-last: center;
+      background: #e5e5e5;
       color: #000;
       border: none;
       border-radius: 6px;
       box-sizing: border-box;
   }
-
- #video-container {
-      position: relative; /* ensure loading popup is positioned relative to video */
-      width: 98%;
-      max-width: 100%;
-  }
-
-  #video-container video {
-      width: 100%;
-      height: 35vh;    /* short and wide */
-      max-height: 40vh;
-      margin: 0 auto;
-      display: block;
-      object-fit: contain;
-      border-radius: 8px;
-  }
-
   #loading {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      font-size: 16px;           /* slightly smaller on mobile */
-      padding: 10px 16px;        /* reduce padding for mobile */
+      font-size: 16px;
+      padding: 10px 16px;
       border-radius: 6px;
       background: rgba(0, 0, 0, 0.6);
       color: #fff;
       display: none;
       text-align: center;
-      max-width: 90%;            /* ensure it doesn’t overflow video */
+      max-width: 90%;
       box-sizing: border-box;
   }
 }
 </style>
-
 </head>
 <body>
 <h1><span class="cyan">Flex</span> Stream</h1>
@@ -629,150 +611,130 @@ function updateDebug(msg){ debugOverlay.textContent = msg; }
 
 titleInput.addEventListener('input', () => {
     const query = titleInput.value.trim();
-
-    // 🔹 Reset season & episode dropdowns whenever the title changes
     selectedTmdbId = null;
     seasonSelect.innerHTML = '<option value="">Season</option>';
     episodeSelect.innerHTML = '<option value="">Episode</option>';
-
-    if (!query) {
-        dropdown.style.display = 'none';
-        return;
-    }
+    dropdown.style.display = 'none';
+    if(!query) return;
 
     fetch(`/autocomplete?q=${encodeURIComponent(query)}`)
-        .then(r => r.json())
-        .then(suggestions => {
-            if (!Array.isArray(suggestions)) {
-                console.error('Autocomplete API returned non-array:', suggestions);
-                dropdown.style.display = 'none';
-                return;
-            }
-
-            // Remove duplicates (case-insensitive)
-            const seen = new Set();
-            const uniqueSuggestions = suggestions.filter(s => {
-                const lower = s.toLowerCase();
-                if (seen.has(lower)) return false;
-                seen.add(lower);
-                return true;
-            });
-
-            dropdown.innerHTML = '';
-            if (uniqueSuggestions.length === 0) {
-                dropdown.style.display = 'none';
-                return;
-            }
-
-            uniqueSuggestions.forEach(s => {
-                const li = document.createElement('li');
+        .then(r=>r.json())
+        .then(suggestions=>{
+            if(!Array.isArray(suggestions) || suggestions.length===0) return;
+            dropdown.innerHTML='';
+            suggestions.forEach(s=>{
+                const li=document.createElement('li');
                 li.textContent = s;
-                li.addEventListener('click', () => {
+                li.addEventListener('click', ()=>{
                     titleInput.value = s;
-                    dropdown.style.display = 'none';
-                    loadSeasons(s); // Load seasons after user picks a title
+                    dropdown.style.display='none';
+                    loadSeasons(s.replace(/\s+\(\d{4}\)$/, ''));
                 });
                 dropdown.appendChild(li);
             });
-
             const rect = titleInput.getBoundingClientRect();
             dropdown.style.top = rect.bottom + window.scrollY + 'px';
             dropdown.style.left = rect.left + window.scrollX + 'px';
             dropdown.style.width = rect.width + 'px';
-            dropdown.style.display = 'block';
-        })
-        .catch(err => {
-            console.error('Autocomplete fetch error:', err);
-            dropdown.style.display = 'none';
+            dropdown.style.display='block';
         });
 });
 
-
-document.addEventListener('click', (e) => {
-    if(!titleInput.contains(e.target) && !dropdown.contains(e.target)){ dropdown.style.display='none'; }
+document.addEventListener('click', (e)=>{
+    if(!titleInput.contains(e.target) && !dropdown.contains(e.target)){
+        dropdown.style.display='none';
+    }
 });
 
 function loadSeasons(title){
     fetch(`/seasons?title=${encodeURIComponent(title)}`)
-        .then(r => r.json())
-        .then(data => {
-            selectedTmdbId = data.tmdb_id;
-            const seasons = data.seasons;
-            seasonSelect.innerHTML = '<option value="">Season</option>';
-            seasons.forEach(s => {
-                const opt = document.createElement('option');
-                opt.value = s.season_number;
-                opt.textContent = s.name;
-                seasonSelect.appendChild(opt);
-            });
-            episodeSelect.innerHTML = '<option value="">Episode</option>';
+    .then(r=>r.json())
+    .then(data=>{
+        selectedTmdbId = data.tmdb_id;
+        seasonSelect.innerHTML = '<option value="">Season</option>';
+        data.seasons.forEach(s=>{
+            const opt=document.createElement('option');
+            opt.value = s.season_number;
+            opt.textContent = s.name;
+            seasonSelect.appendChild(opt);
         });
+        episodeSelect.innerHTML='<option value="">Episode</option>';
+    });
 }
 
-seasonSelect.addEventListener('change', () => {
+seasonSelect.addEventListener('change', ()=>{
     const seasonNumber = seasonSelect.value;
     if(!seasonNumber || !selectedTmdbId) return;
-
     fetch(`/episodes?tmdb_id=${selectedTmdbId}&season_number=${seasonNumber}`)
-        .then(r => r.json())
-        .then(eps => {
+        .then(r=>r.json())
+        .then(eps=>{
             episodeSelect.innerHTML = '<option value="">Episode</option>';
             const today = new Date();
-
-            eps.forEach(ep => {
-                // Only include episodes that have already aired
+            eps.forEach(ep=>{
                 if(!ep.air_date || new Date(ep.air_date) > today) return;
-                const opt = document.createElement('option');
-                opt.value = ep.episode_number;
-                opt.textContent = `${ep.episode_number}: ${ep.name}`;
+                const opt=document.createElement('option');
+                opt.value=ep.episode_number;
+                opt.textContent=`${ep.episode_number}: ${ep.name}`;
                 episodeSelect.appendChild(opt);
             });
-
-            if(episodeSelect.options.length === 1){
-                const opt = document.createElement('option');
-                opt.textContent = 'No released episodes';
-                opt.disabled = true;
+            if(episodeSelect.options.length===1){
+                const opt=document.createElement('option');
+                opt.textContent='No released episodes';
+                opt.disabled=true;
                 episodeSelect.appendChild(opt);
             }
         });
 });
 
+function parseTitleAndYear(fullTitle){
+    const match = fullTitle.match(/^(.*)\s+\((\d{4})\)$/);
+    return match ? {title: match[1], year: match[2]} : {title: fullTitle, year:null};
+}
+
 function load(){
-    const title = titleInput.value.trim();
+    const {title, year} = parseTitleAndYear(titleInput.value.trim());
+    if(!title){ alert('Enter a title'); return; }
     const season = seasonSelect.value;
     const episode = episodeSelect.value;
-    if(!title){ alert('Enter a title'); return; }
+
     showLoading(true);
     updateDebug('Searching TMDb...');
-    fetch(`/get_m3u8?title=${encodeURIComponent(title)}&season=${season}&episode=${episode}`)
-        .then(r => r.text())
-        .then(url => {
-            showLoading(false);
-            if(!url){ updateDebug('No video found'); alert('No video found'); return; }
-            updateDebug('Video URL captured. Loading HLS...');
-            const proxied = '/proxy_playlist?url=' + encodeURIComponent(url);
-            if(Hls.isSupported()){
-                if(hlsInstance) hlsInstance.destroy();
-                hlsInstance = new Hls();
-                hlsInstance.loadSource(proxied);
-                hlsInstance.attachMedia(video);
-                hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { updateDebug('HLS manifest parsed. Playing video...'); video.play().catch(()=>{}); });
-               hlsInstance.on(Hls.Events.ERROR, (event, data) => {
-    // updateDebug('Hls.js error: ' + JSON.stringify(data)); // disabled
-    console.error('Hls.js error:', data); // still logs to console if you want
-});
+    let url = `/get_m3u8?title=${encodeURIComponent(title)}`;
+    if(year) url += `&year=${year}`;
+    if(season) url += `&season=${season}`;
+    if(episode) url += `&episode=${episode}`;
 
-            } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-                video.src = proxied;
-                video.addEventListener('loadedmetadata', () => { updateDebug('Video metadata loaded. Playing...'); video.play().catch(()=>{}); });
-            } else { updateDebug('HLS not supported in this browser'); alert('HLS not supported in this browser'); }
-        })
-        .catch(err => { showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); });
+    fetch(url).then(r=>r.text()).then(url=>{
+        showLoading(false);
+        if(!url){ updateDebug('No video found'); alert('No video found'); return; }
+        updateDebug('Video URL captured. Loading HLS...');
+        const proxied = '/proxy_playlist?url='+encodeURIComponent(url);
+
+        if(Hls.isSupported()){
+            if(hlsInstance) hlsInstance.destroy();
+            hlsInstance = new Hls();
+            hlsInstance.loadSource(proxied);
+            hlsInstance.attachMedia(video);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, ()=>{ video.play().catch(()=>{}); });
+            hlsInstance.on(Hls.Events.ERROR,(e,data)=>{ console.error('Hls.js error:',data); });
+        } else if(video.canPlayType('application/vnd.apple.mpegurl')){
+            video.src = proxied;
+            video.addEventListener('loadedmetadata', ()=>{ video.play().catch(()=>{}); });
+        } else{
+            updateDebug('HLS not supported in this browser');
+            alert('HLS not supported in this browser');
+        }
+    }).catch(err=>{
+        showLoading(false);
+        updateDebug('Error: '+err);
+        alert('Failed to load video');
+    });
 }
 </script>
 </body>
 </html>
 """
+
 
 # ----------------------------
 # Endpoint to get m3u8 URL via TMDb lookup
@@ -782,28 +744,45 @@ def get_m3u8():
     title = request.args.get("title")
     season = request.args.get("season")
     episode = request.args.get("episode")
+    year = request.args.get("year")  # New parameter
     if not title:
         return "", 400
 
     update_msg = []
 
-    # Step 1: Search TMDb instead of OMDb
+    # Step 1: Search TMDb
     results = search_tmdb(title)
-    update_msg.append(f"TMDB returned {len(results)} results")
+    update_msg.append(f"TMDb returned {len(results)} results")
 
+    # Step 2: Filter by year if provided
+    if year:
+        filtered = []
+        for r in results:
+            r_year = None
+            if r["media_type"] == "movie":
+                r_year = r.get("release_date", "")[:4]
+            else:  # tv
+                r_year = r.get("first_air_date", "")[:4]
+            if r_year == year:
+                filtered.append(r)
+        if filtered:
+            results = filtered
+            update_msg.append(f"Filtered results by year: {year} -> {len(results)} results")
+
+    # Step 3: pick best match using fuzzy matching
     best = get_best_match(title, results)
     if not best:
         return "", 404
 
-    # Step 2: Get IMDb ID from TMDb external IDs
     tmdb_id = best["id"]
     type_ = best.get("media_type", "movie").lower()
 
+    # Step 4: External IDs to get IMDb
     if type_ == "movie":
         external_url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
     else:
         external_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
-
+    
     external_resp = requests.get(external_url).json()
     imdb_id = external_resp.get("imdb_id")
     if not imdb_id:
@@ -811,7 +790,7 @@ def get_m3u8():
         debug("\n".join(update_msg))
         return "", 404
 
-    # Step 3: Build vsrc embed URL
+    # Step 5: Build vsrc embed URL
     if type_ == "tv" and season and episode:
         vsrc_embed = f"https://vsrc.su/embed/tv?imdb={imdb_id}&season={season}&episode={episode}&dts=dd"
     else:
