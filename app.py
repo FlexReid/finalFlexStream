@@ -15,7 +15,11 @@ app = Flask(__name__)
 # Configuration
 # ----------------------------
 TMDB_API_KEY = "123240ec331a97bb476ad9a05f86c3bf"  # Replace with your TMDb API key
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Origin": "https://cloudnestra.com",
+    "Referer": "https://cloudnestra.com/",
+}
 REQUEST_TIMEOUT = 15
 CACHE_TTL = 5
 _playlist_cache = {}
