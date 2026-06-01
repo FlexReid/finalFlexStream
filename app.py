@@ -8,6 +8,10 @@ from playwright.sync_api import sync_playwright
 from rapidfuzz import process, fuzz
 import os
 import datetime
+import subprocess
+import json
+import undetected_chromedriver as uc
+
 
 app = Flask(__name__)
 
@@ -123,61 +127,146 @@ def get_player_iframe_src(vsrc_url: str) -> str:
     debug(f"Resolved iframe URL: {src}")
     return src
 
+def get_chrome_major_version():
+    try:
+        result = subprocess.run(
+            ["reg", "query", r"HKLM\SOFTWARE\Google\Chrome\BLBeacon", "/v", "version"],
+            capture_output=True, text=True
+        )
+        version_str = result.stdout.strip().split()[-1]
+        return int(version_str.split(".")[0])
+    except Exception:
+        try:
+            result = subprocess.run(
+                ["reg", "query", r"HKCU\SOFTWARE\Google\Chrome\BLBeacon", "/v", "version"],
+                capture_output=True, text=True
+            )
+            version_str = result.stdout.strip().split()[-1]
+            return int(version_str.split(".")[0])
+        except Exception:
+            return None
+
 def capture_first_m3u8(page_url: str, retries=3) -> str:
-    for attempt in range(1, retries + 1):
-        debug(f"Playwright attempt {attempt} for {page_url}")
-        with sync_playwright() as p:
-            browser = p.webkit.launch()
-            context = browser.new_context()
-            page = context.new_page()
-            captured = {"url": None}
+    # --- Attempt 1: Playwright (webkit) ---
+    debug(f"Playwright attempt for {page_url}")
+    with sync_playwright() as p:
+        browser = p.webkit.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        captured = {"url": None}
 
-            def on_request(req):
-                url = req.url
-                if ".m3u8" in url and not captured["url"]:
-                    captured["url"] = url
-                    debug(f"Captured m3u8 request: {url}")
+        def on_request(req):
+            url = req.url
+            if ".m3u8" in url and not captured["url"]:
+                captured["url"] = url
+                debug(f"Captured m3u8 request: {url}")
 
-            page.on("request", on_request)
+        page.on("request", on_request)
+        try:
+            page.goto(page_url, wait_until="load", timeout=30000)
+        except Exception as e:
+            debug(f"Page load error: {e}")
 
+        selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
+        clicked = False
+        for sel in selectors:
             try:
-                page.goto(page_url, wait_until="load", timeout=30000)
-            except Exception as e:
-                debug(f"Page load error: {e}")
+                el = page.query_selector(sel)
+                if el:
+                    el.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                page.mouse.click(640, 360)
+            except Exception:
+                pass
 
-            selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
-            clicked = False
-            for sel in selectors:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        el.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
+        for _ in range(30):
+            if captured["url"]:
+                break
+            page.wait_for_timeout(500)
 
-            if not clicked:
+        context.close()
+        browser.close()
+
+        if captured["url"]:
+            debug(f"Playwright succeeded: {captured['url']}")
+            return captured["url"]
+
+    debug("Playwright failed, falling back to undetected-chromedriver...")
+
+    # --- Fallback: undetected-chromedriver ---
+    chrome_version = get_chrome_major_version()
+    debug(f"Detected Chrome version: {chrome_version}")
+
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--autoplay-policy=no-user-gesture-required")
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    options.page_load_strategy = "eager"
+
+    kwargs = {"options": options, "use_subprocess": True}
+    if chrome_version:
+        kwargs["version_main"] = chrome_version
+
+    driver = None
+    try:
+        driver = uc.Chrome(**kwargs)
+        for attempt in range(1, retries + 1):
+            debug(f"Chrome attempt {attempt} for {page_url}")
+            try:
+                driver.get(page_url)
                 try:
-                    page.mouse.click(640, 360)
+                    driver.get_log("performance")
                 except Exception:
                     pass
 
-            for _ in range(30):
-                if captured["url"]:
-                    break
-                page.wait_for_timeout(500)
+                for sel in ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]:
+                    try:
+                        el = driver.find_element("css selector", sel)
+                        driver.execute_script("arguments[0].click();", el)
+                        break
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        driver.execute_script("document.elementFromPoint(640, 360)?.click();")
+                    except Exception:
+                        pass
 
-            context.close()
-            browser.close()
+                deadline = time.time() + 100
+                while time.time() < deadline:
+                    try:
+                        logs = driver.get_log("performance")
+                    except Exception:
+                        break
+                    for entry in logs:
+                        try:
+                            msg = json.loads(entry["message"])["message"]
+                            if msg.get("method") == "Network.requestWillBeSent":
+                                url = msg["params"]["request"]["url"]
+                                if ".m3u8" in url:
+                                    debug(f"Chrome captured m3u8: {url}")
+                                    return url
+                        except Exception:
+                            continue
+                    time.sleep(0.2)
+            except Exception as e:
+                debug(f"Chrome attempt {attempt} error: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
-            if captured["url"]:
-                debug(f"Successfully captured m3u8: {captured['url']}")
-                return captured["url"]
-
-    debug("All Playwright attempts failed")
+    debug("All attempts failed")
     return None
-
 def get_best_variant(m3u8_url: str) -> str:
     debug(f"Fetching m3u8 to find best variant: {m3u8_url}")
     r = requests.get(m3u8_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
