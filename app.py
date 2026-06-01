@@ -11,6 +11,7 @@ import datetime
 import subprocess
 import json
 import undetected_chromedriver as uc
+import threading
 
 
 app = Flask(__name__)
@@ -146,80 +147,38 @@ def get_chrome_major_version():
         except Exception:
             return None
 
+
+
 def capture_first_m3u8(page_url: str, retries=3) -> str:
-    # --- Attempt 1: Playwright (webkit) ---
-    debug(f"Playwright attempt for {page_url}")
-    with sync_playwright() as p:
-        browser = p.webkit.launch(headless=False)
-        context = browser.new_context()
-        page = context.new_page()
-        captured = {"url": None}
 
-        def on_request(req):
-            url = req.url
-            if ".m3u8" in url and not captured["url"]:
-                captured["url"] = url
-                debug(f"Captured m3u8 request: {url}")
+    def attempt() -> str:
+        result = {"url": None}
+        lock = threading.Lock()
+        done = threading.Event()
+        chrome_failed = threading.Event()  # NEW: signals Chrome exited early
 
-        page.on("request", on_request)
-        try:
-            page.goto(page_url, wait_until="load", timeout=30000)
-        except Exception as e:
-            debug(f"Page load error: {e}")
+        # --- Chrome thread ---
+        def chrome_worker():
+            chrome_version = get_chrome_major_version()
+            debug(f"[Chrome] Detected Chrome version: {chrome_version}")
 
-        selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
-        clicked = False
-        for sel in selectors:
+            options = uc.ChromeOptions()
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--autoplay-policy=no-user-gesture-required")
+            options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+            options.page_load_strategy = "eager"
+
+            kwargs = {"options": options, "use_subprocess": True}
+            if chrome_version:
+                kwargs["version_main"] = chrome_version
+
+            driver = None
             try:
-                el = page.query_selector(sel)
-                if el:
-                    el.click()
-                    clicked = True
-                    break
-            except Exception:
-                continue
-        if not clicked:
-            try:
-                page.mouse.click(640, 360)
-            except Exception:
-                pass
+                driver = uc.Chrome(**kwargs)
+                debug("[Chrome] Browser launched")
 
-        for _ in range(30):
-            if captured["url"]:
-                break
-            page.wait_for_timeout(500)
-
-        context.close()
-        browser.close()
-
-        if captured["url"]:
-            debug(f"Playwright succeeded: {captured['url']}")
-            return captured["url"]
-
-    debug("Playwright failed, falling back to undetected-chromedriver...")
-
-    # --- Fallback: undetected-chromedriver ---
-    chrome_version = get_chrome_major_version()
-    debug(f"Detected Chrome version: {chrome_version}")
-
-    options = uc.ChromeOptions()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--autoplay-policy=no-user-gesture-required")
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    options.page_load_strategy = "eager"
-
-    kwargs = {"options": options, "use_subprocess": True}
-    if chrome_version:
-        kwargs["version_main"] = chrome_version
-
-    driver = None
-    try:
-        driver = uc.Chrome(**kwargs)
-        for attempt in range(1, retries + 1):
-            debug(f"Chrome attempt {attempt} for {page_url}")
-            try:
                 driver.get(page_url)
                 try:
                     driver.get_log("performance")
@@ -239,8 +198,10 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                     except Exception:
                         pass
 
-                deadline = time.time() + 100
+                deadline = time.time() + 120
                 while time.time() < deadline:
+                    if done.is_set():
+                        break
                     try:
                         logs = driver.get_log("performance")
                     except Exception:
@@ -251,19 +212,107 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                             if msg.get("method") == "Network.requestWillBeSent":
                                 url = msg["params"]["request"]["url"]
                                 if ".m3u8" in url:
-                                    debug(f"Chrome captured m3u8: {url}")
-                                    return url
+                                    with lock:
+                                        if not result["url"]:
+                                            result["url"] = url
+                                            debug(f"[Chrome] Captured m3u8: {url}")
+                                    done.set()
+                                    return
                         except Exception:
                             continue
                     time.sleep(0.2)
+
             except Exception as e:
-                debug(f"Chrome attempt {attempt} error: {e}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+                debug(f"[Chrome] Error: {e}")
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                # NEW: if Chrome exits without finding the URL, signal failure
+                if not done.is_set():
+                    debug("[Chrome] Exited without capturing m3u8")
+                    chrome_failed.set()
+                    done.set()  # unblock Playwright's wait loop
+
+        # --- Playwright runs on main thread, Chrome in background ---
+        chrome_thread = threading.Thread(target=chrome_worker, daemon=True)
+        chrome_thread.start()
+        debug("[Playwright] Starting...")
+
+        try:
+            with sync_playwright() as p:
+                browser = p.webkit.launch(headless=False)
+                context = browser.new_context()
+                page = context.new_page()
+
+                def on_request(req):
+                    url = req.url
+                    if ".m3u8" in url:
+                        with lock:
+                            if not result["url"]:
+                                result["url"] = url
+                                debug(f"[Playwright] Captured m3u8: {url}")
+                        done.set()
+
+                page.on("request", on_request)
+                try:
+                    page.goto(page_url, wait_until="load", timeout=30000)
+                except Exception as e:
+                    debug(f"[Playwright] Page load error: {e}")
+
+                selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
+                clicked = False
+                for sel in selectors:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            el.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    try:
+                        page.mouse.click(640, 360)
+                    except Exception:
+                        pass
+
+                for _ in range(30):
+                    if done.is_set():
+                        break
+                    page.wait_for_timeout(500)
+
+                context.close()
+                browser.close()
+
+        except Exception as e:
+            debug(f"[Playwright] Fatal error: {e}")
+
+        if not done.is_set():
+            debug("Waiting for Chrome to finish...")
+            done.wait(timeout=120)
+
+        chrome_thread.join(timeout=5)
+
+        # NEW: return None explicitly if Chrome failed without a result
+        if chrome_failed.is_set() and not result["url"]:
+            return None
+
+        return result["url"]
+
+    # --- Retry loop: run attempt(), retry once if Chrome failed (result is None) ---
+    url = attempt()
+    if url:
+        debug(f"Final m3u8: {url}")
+        return url
+
+    debug("[Retry] First attempt failed (Chrome quit early), retrying once...")
+    url = attempt()
+    if url:
+        debug(f"Final m3u8 (retry): {url}")
+        return url
 
     debug("All attempts failed")
     return None
