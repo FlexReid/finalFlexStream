@@ -22,8 +22,8 @@ app = Flask(__name__)
 TMDB_API_KEY = "123240ec331a97bb476ad9a05f86c3bf"
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Origin": "https://cloudnestra.com",
-    "Referer": "https://cloudnestra.com/",
+    "Origin": "https://cloudorchestranova.com",
+    "Referer": "https://cloudorchestranova.com/",
 }
 REQUEST_TIMEOUT = 15
 CACHE_TTL = 5
