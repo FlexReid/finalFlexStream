@@ -3,7 +3,7 @@ import re
 import time
 import requests
 from flask import Flask, request, Response, render_template_string, jsonify
-from urllib.parse import urljoin, quote_plus, unquote_plus
+from urllib.parse import urljoin, quote_plus, unquote_plus, urlparse, urlunparse, parse_qs, urlencode
 from playwright.sync_api import sync_playwright
 from rapidfuzz import process, fuzz
 import os
@@ -455,6 +455,21 @@ def get_best_variant(m3u8_url: str) -> str:
                           if re.search(r"RESOLUTION=(\d+)x(\d+)", v[0]) else 0)
     )[1]
     final_url = urljoin(m3u8_url, best_variant)
+
+    # The variant path from the master playlist usually doesn't carry the
+    # ?token=... query param, since urljoin() only keeps query params that
+    # are explicitly part of the relative path. Re-attach the token from the
+    # master m3u8 request so the variant URL stays authenticated.
+    master_token = parse_qs(urlparse(m3u8_url).query).get("token", [None])[0]
+    if master_token:
+        variant_parts = urlparse(final_url)
+        variant_qs = parse_qs(variant_parts.query)
+        if "token" not in variant_qs:
+            variant_qs["token"] = [master_token]
+            new_query = urlencode(variant_qs, doseq=True)
+            final_url = urlunparse(variant_parts._replace(query=new_query))
+            debug(f"Appended token from master m3u8 to variant URL: {final_url}")
+
     return final_url
 
 
