@@ -20,11 +20,26 @@ app = Flask(__name__)
 # Configuration
 # ----------------------------
 TMDB_API_KEY = "123240ec331a97bb476ad9a05f86c3bf"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Origin": "https://cloudorchestranova.com",
-    "Referer": "https://cloudorchestranova.com/",
-}
+
+# Origin/Referer captured once from the first resolved iframe URL, then reused
+# for every subsequent request (m3u8, variant probing, segments) for the rest
+# of that stream's lifetime.
+_current_origin = {"value": None}
+
+def set_origin_from_url(url: str):
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    _current_origin["value"] = origin
+    debug(f"Origin/Referer locked to: {origin}")
+
+def get_headers() -> dict:
+    origin = _current_origin["value"] or "https://cloudorchestranova.com"
+    return {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": origin,
+        "Referer": origin + "/",
+    }
+
 REQUEST_TIMEOUT = 15
 CACHE_TTL = 5
 _playlist_cache = {}
@@ -182,7 +197,7 @@ def get_episodes():
 # ----------------------------
 def get_player_iframe_src(vsrc_url: str) -> str:
     debug(f"Fetching vsrc page: {vsrc_url}")
-    r = requests.get(vsrc_url, headers=HEADERS, timeout=10)
+    r = requests.get(vsrc_url, headers=get_headers(), timeout=10)
     m = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', r.text)
     if not m:
         debug("No iframe src found in vsrc page")
@@ -193,6 +208,7 @@ def get_player_iframe_src(vsrc_url: str) -> str:
     elif src.startswith("/"):
         src = urljoin(vsrc_url, src)
     debug(f"Resolved iframe URL: {src}")
+    set_origin_from_url(src)
     return src
 
 
@@ -445,7 +461,7 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
 
 def get_best_variant(m3u8_url: str) -> str:
     debug(f"Fetching m3u8 to find best variant: {m3u8_url}")
-    r = requests.get(m3u8_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r = requests.get(m3u8_url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
     variants = re.findall(r'(#EXT-X-STREAM-INF:[^\n]+\n)([^\n]+\.m3u8)', r.text)
     if not variants:
         return m3u8_url
@@ -521,7 +537,7 @@ def extract_ts_packets(data: bytes) -> bytes:
 # HLS Proxy helpers
 # ----------------------------
 def fetch_bytes(url):
-    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r = requests.get(url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.content
 
