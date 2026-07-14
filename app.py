@@ -529,15 +529,37 @@ def rewrite_playlist(original_playlist_url: str, playlist_text: str):
     lines = playlist_text.splitlines()
     new_lines = []
     seq = 0
+
+    # Variant/segment URLs pulled from a master playlist often don't carry
+    # the ?token=... query param (urljoin only keeps params that are
+    # explicitly part of the relative path). Re-attach it from the parent
+    # playlist URL so every proxied request stays authenticated.
+    master_token = parse_qs(urlparse(original_playlist_url).query).get("token", [None])[0]
+
     for line in lines:
         line_stripped = line.strip()
         if not line_stripped or line_stripped.startswith('#'):
             new_lines.append(line)
             continue
+
         abs_url = urljoin(original_playlist_url, line_stripped)
-        proxied = f"/segment?u={quote_plus(abs_url)}&i={seq}"
+
+        if master_token:
+            parts = urlparse(abs_url)
+            qs = parse_qs(parts.query)
+            if "token" not in qs:
+                qs["token"] = [master_token]
+                abs_url = urlunparse(parts._replace(query=urlencode(qs, doseq=True)))
+
+        if ".m3u8" in abs_url:
+            # This line points to another playlist (a quality variant in a
+            # master playlist) rather than a media segment. Proxy it
+            # recursively so hls.js can discover it as a selectable level.
+            proxied = f"/proxy_playlist?url={quote_plus(abs_url)}"
+        else:
+            proxied = f"/segment?u={quote_plus(abs_url)}&i={seq}"
+            seq += 1
         new_lines.append(proxied)
-        seq += 1
     return "\n".join(new_lines)
 
 
@@ -721,12 +743,13 @@ def get_m3u8():
     if not first_m3u8:
         return "", 404
     update_msg.append(f"First m3u8 captured: {first_m3u8}")
-
-    final_m3u8 = get_best_variant(first_m3u8)
-    update_msg.append(f"Final m3u8 URL: {final_m3u8}")
     debug("\n".join(update_msg))
 
-    return final_m3u8
+    # Return the raw playlist URL as-is (rather than pre-resolving to the
+    # single best-quality variant). If this is a master playlist, /proxy_playlist
+    # will expose every quality variant it references so hls.js can build a
+    # quality selector and switch between them client-side.
+    return first_m3u8
 
 
 # ----------------------------
@@ -835,6 +858,25 @@ button:hover {
   pointer-events: none;
   z-index: 100;
   white-space: pre-line;
+}
+
+#quality {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 100;
+  background-color: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  max-width: 110px;
+  cursor: pointer;
+}
+
+#quality:hover {
+  background-color: rgba(0, 0, 0, 0.85);
 }
 
 .autocomplete-dropdown {
@@ -950,6 +992,7 @@ footer {
 </div>
 <div id="video-container">
 <video id="video" controls crossorigin playsinline></video>
+<select id="quality" style="display:none;"><option value="-1">Auto</option></select>
 <div id="loading">Loading video, please wait...</div>
 <div id="debug-overlay"></div>
 </div>
@@ -961,12 +1004,44 @@ const debugOverlay = document.getElementById('debug-overlay');
 const titleInput = document.getElementById('title');
 const seasonSelect = document.getElementById('season');
 const episodeSelect = document.getElementById('episode');
+const qualitySelect = document.getElementById('quality');
 const dropdown = document.getElementById('autocomplete');
 let hlsInstance = null;
 let selectedTmdbId = null;
 
 function showLoading(show){ loading.style.display = show ? 'block' : 'none'; }
 function updateDebug(msg){ debugOverlay.textContent = msg; }
+
+function levelLabel(level){
+    if(level.height) return `${level.height}p`;
+    if(level.bitrate) return `${Math.round(level.bitrate/1000)} kbps`;
+    return 'Unknown';
+}
+
+function populateQualityLevels(levels){
+    qualitySelect.innerHTML = '<option value="-1">Auto</option>';
+    if(!levels || levels.length < 2){
+        qualitySelect.style.display = 'none';
+        return;
+    }
+    // Highest quality first
+    levels
+        .map((lvl, idx) => ({idx, lvl}))
+        .sort((a, b) => (b.lvl.height||0) - (a.lvl.height||0) || (b.lvl.bitrate||0) - (a.lvl.bitrate||0))
+        .forEach(({idx, lvl}) => {
+            const opt = document.createElement('option');
+            opt.value = idx;
+            opt.textContent = levelLabel(lvl);
+            qualitySelect.appendChild(opt);
+        });
+    qualitySelect.value = '-1';
+    qualitySelect.style.display = 'inline-block';
+}
+
+qualitySelect.addEventListener('change', () => {
+    if(!hlsInstance) return;
+    hlsInstance.currentLevel = parseInt(qualitySelect.value, 10); // -1 = auto
+});
 
 titleInput.addEventListener('input', () => {
     const query = titleInput.value.trim();
@@ -1058,6 +1133,7 @@ function load(){
 
     showLoading(true);
     updateDebug('Searching TMDb...');
+    qualitySelect.style.display = 'none';
     let url = `/get_m3u8?title=${encodeURIComponent(title)}`;
     if(year) url += `&year=${year}`;
     if(season) url += `&season=${season}`;
@@ -1074,9 +1150,19 @@ function load(){
             hlsInstance = new Hls();
             hlsInstance.loadSource(proxied);
             hlsInstance.attachMedia(video);
-            hlsInstance.on(Hls.Events.MANIFEST_PARSED, ()=>{ video.play().catch(()=>{}); });
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, (event, data)=>{
+                populateQualityLevels(data.levels);
+                video.play().catch(()=>{});
+            });
+            hlsInstance.on(Hls.Events.LEVEL_SWITCHED, (event, data)=>{
+                const lvl = hlsInstance.levels[data.level];
+                if(lvl) updateDebug(`Playing: ${levelLabel(lvl)}${qualitySelect.value === '-1' ? ' (auto)' : ''}`);
+            });
             hlsInstance.on(Hls.Events.ERROR,(e,data)=>{ console.error('Hls.js error:',data); });
         } else if(video.canPlayType('application/vnd.apple.mpegurl')){
+            // Native HLS (Safari) handles adaptive quality internally;
+            // manual level selection via JS isn't available here.
+            qualitySelect.style.display = 'none';
             video.src = proxied;
             video.addEventListener('loadedmetadata', ()=>{ video.play().catch(()=>{}); });
         } else{
