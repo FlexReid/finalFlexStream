@@ -586,7 +586,7 @@ _jobs_lock = threading.Lock()
 # phone before we clean it up automatically. Downloads are no longer
 # triggered automatically when a job finishes, so without this sweep a
 # completed file that's never tapped would sit on disk forever.
-JOB_RETENTION_SECONDS = 30 * 60  # 30 minutes
+JOB_RETENTION_SECONDS = 24 * 60 * 60  # 1 day — the hard cap for a file nobody ever downloaded
 
 
 def _cleanup_stale_jobs():
@@ -751,14 +751,17 @@ def download_ready():
         # the user actually taps "Download to device".
         return jsonify({"status": "done"})
 
-    # Not a peek: stream the file to the client, then clean up.
+    # Not a peek: stream the file to the client. We deliberately do NOT pop
+    # the job or delete the file here — only once generate() below confirms
+    # every byte was actually sent. If the connection drops partway through
+    # (backgrounded tab, flaky network, etc.), the job and file are left
+    # exactly as they were so the client can just retry the same job_id.
     mp4_path = job["path"]
     title    = job.get("title", "video")
 
-    with _jobs_lock:
-        _jobs.pop(job_id, None)
-
     if not mp4_path or not os.path.isfile(mp4_path):
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
         return "File not found on server", 404
 
     safe_title = re.sub(r'[^A-Za-z0-9 ._-]', '', title).strip() or "video"
@@ -766,16 +769,26 @@ def download_ready():
     mp4_size   = os.path.getsize(mp4_path)
 
     def generate():
+        completed = False
         try:
             with open(mp4_path, "rb") as f:
                 while True:
                     chunk = f.read(1024 * 1024)
                     if not chunk:
+                        completed = True
                         break
                     yield chunk
         finally:
-            try: os.remove(mp4_path)
-            except OSError: pass
+            if completed:
+                with _jobs_lock:
+                    _jobs.pop(job_id, None)
+                try:
+                    os.remove(mp4_path)
+                    debug(f"[job {job_id}] Fully delivered to client — removed {mp4_path}")
+                except OSError:
+                    pass
+            else:
+                debug(f"[job {job_id}] Transfer interrupted before completion — keeping file for retry")
 
     resp = Response(generate(), mimetype="video/mp4")
     resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -1037,7 +1050,7 @@ footer { margin-top: auto; text-align: center; padding: 10px; font-size: 0.9rem;
   <div id="loading">Loading video, please wait...</div>
   <div id="debug-overlay"></div>
 </div>
-<button id="downloadBtn" disabled>Download MP4</button>
+<button id="downloadBtn">Download MP4</button>
 <div id="downloads-panel"></div>
 <footer>Powered by <span class="cyan">Flex</span> Stream</footer>
 <script>
@@ -1150,9 +1163,14 @@ seasonSelect.addEventListener('change',()=>{
 
 function parseTitleAndYear(f){ const m=f.match(/^(.*)\s+\((\d{4})\)$/); return m?{title:m[1],year:m[2]}:{title:f,year:null}; }
 
-function load(){
+function resolveAndPlay(){
+    // Resolves whatever is currently in the title/season/episode fields,
+    // starts it playing, and returns a Promise of the resolved m3u8 URL (or
+    // null on failure). Used by both the Load & Play button and the
+    // Download button, so downloading no longer requires a separate load
+    // step first.
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
-    if(!title){ alert('Enter a title'); return; }
+    if(!title){ alert('Enter a title'); return Promise.resolve(null); }
     const season=seasonSelect.value, episode=episodeSelect.value;
     showLoading(true); updateDebug('Searching TMDb...'); qualitySelect.style.display='none';
     let url='/get_m3u8?title='+encodeURIComponent(title);
@@ -1163,9 +1181,9 @@ function load(){
     currentTitle=titleInput.value.trim()||title;
     if(season) currentTitle+=' S'+season;
     if(episode) currentTitle+='E'+episode;
-    fetch(url).then(r=>r.text()).then(m3u8=>{
+    return fetch(url).then(r=>r.text()).then(m3u8=>{
         showLoading(false);
-        if(!m3u8){ updateDebug('No video found'); alert('No video found'); return; }
+        if(!m3u8){ updateDebug('No video found'); alert('No video found'); return null; }
         updateDebug('Video URL captured. Loading HLS...');
         currentM3u8Url=m3u8;
         downloadBtn.disabled=false;
@@ -1187,36 +1205,49 @@ function load(){
             video.src=proxied;
             video.addEventListener('loadedmetadata',()=>{ video.play().catch(()=>{}); });
         } else { updateDebug('HLS not supported in this browser'); alert('HLS not supported in this browser'); }
-    }).catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); });
+        return m3u8;
+    }).catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
+}
+
+function load(){
+    resolveAndPlay();
 }
 
 // ── Download ─────────────────────────────────────────────────────────────
-// POST to /download_mp4 → get job_id immediately (server thread is freed).
-// Poll /download_ready?job_id=... every 2 s until done, then trigger save.
+// The actual fetch+remux work happens entirely server-side in a background
+// thread (see /download_mp4 + /download_ready), so it keeps running even if
+// this tab is backgrounded, frozen, or closed. We persist the job list in
+// localStorage so reopening the page reconnects to anything still running
+// or finished waiting to be saved, instead of losing track of it.
 const downloadsPanel = document.getElementById('downloads-panel');
-let downloadCounter  = 0;
+const ACTIVE_JOBS_KEY = 'flexstream_active_jobs';
 
-function startDownload(m3u8Url, title) {
-    const id   = 'dl-' + (++downloadCounter);
+function getActiveJobs(){ try{ const r=localStorage.getItem(ACTIVE_JOBS_KEY); const a=r?JSON.parse(r):[]; return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+function saveActiveJobs(jobs){ try{ localStorage.setItem(ACTIVE_JOBS_KEY, JSON.stringify(jobs)); }catch(e){} }
+function rememberJob(jobId, title){ const jobs=getActiveJobs().filter(j=>j.job_id!==jobId); jobs.push({job_id:jobId, title:title}); saveActiveJobs(jobs); }
+function forgetJob(jobId){ saveActiveJobs(getActiveJobs().filter(j=>j.job_id!==jobId)); }
+
+function trackJob(jobId, title) {
     const item = document.createElement('div');
     item.className = 'download-item';
-    item.id = id;
     const safeDisplay = title.replace(/</g, '&lt;');
     item.innerHTML =
         '<div class="dl-title-row">' +
             '<span class="dl-title">' + safeDisplay + '</span>' +
-            '<span class="dl-status">Starting…</span>' +
+            '<span class="dl-status">Checking…</span>' +
         '</div>' +
         '<div class="dl-bar-track"><div class="dl-bar-fill indeterminate"></div></div>';
     downloadsPanel.prepend(item);
 
-    const statusEl = item.querySelector('.dl-status');
-    const barEl    = item.querySelector('.dl-bar-fill');
+    const statusEl  = item.querySelector('.dl-status');
+    const barEl     = item.querySelector('.dl-bar-fill');
+    const safeTitle = title.replace(/[^A-Za-z0-9 ._-]/g, '').trim() || 'video';
 
     function setError(msg) {
         barEl.classList.remove('indeterminate');
         statusEl.classList.add('error');
         statusEl.textContent = 'Failed: ' + msg;
+        forgetJob(jobId);
     }
 
     function setProgress(pct) {
@@ -1225,42 +1256,36 @@ function startDownload(m3u8Url, title) {
         statusEl.textContent = pct + '%';
     }
 
-    function triggerSave(jobId, safeTitle, btn) {
-        // Fetches the finished file from the server and saves it to the
-        // phone. Only called when the user taps the "Download to device"
-        // button — not automatically when the server-side job finishes.
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', '/download_ready?job_id=' + encodeURIComponent(jobId), true);
-        xhr.responseType = 'blob';
-        xhr.onload = function() {
-            if (xhr.status === 200) {
-                statusEl.classList.add('done');
-                statusEl.textContent = 'Saved';
-                const a   = document.createElement('a');
-                const url = URL.createObjectURL(xhr.response);
-                a.href = url; a.download = safeTitle + '.mp4';
-                document.body.appendChild(a); a.click(); a.remove();
-                URL.revokeObjectURL(url);
-                if (btn) btn.remove();
-            } else if (xhr.status === 404) {
-                setError('file expired on server — please download again');
-                if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
-            } else {
-                setError('server error ' + xhr.status);
-                if (btn) { btn.disabled = false; btn.textContent = 'Retry download'; }
-            }
-        };
-        xhr.onerror = function() {
-            setError('network error while saving');
-            if (btn) { btn.disabled = false; btn.textContent = 'Retry download'; }
-        };
-        xhr.send();
+    function triggerSave(btn) {
+        // Hand this off to the browser's own download manager instead of
+        // fetching it into JS as a Blob. Blob-buffering requires holding
+        // the entire file in memory before it can be saved, which is why
+        // large (multi-GB) files were getting killed mid-transfer on
+        // mobile. A plain navigation to the URL lets the browser stream
+        // straight to disk — the server already sends
+        // Content-Disposition: attachment, so this triggers a real
+        // download rather than opening the video in the tab.
+        const a = document.createElement('a');
+        a.href = '/download_ready?job_id=' + encodeURIComponent(jobId);
+        a.download = safeTitle + '.mp4';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        statusEl.classList.add('done');
+        statusEl.textContent = "Saving";
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+
+        // We can't get a JS completion callback for a native download, so
+        // we don't assume success here — the server only deletes the file
+        // once it has actually streamed every byte, and this item stays
+        // available (up to the retention cap) in case you need to retry.
     }
 
-    function showDownloadReady(jobId, safeTitle) {
+    function showDownloadReady() {
         setProgress(100);
         statusEl.classList.add('done');
-        statusEl.textContent = 'Ready on server';
+        statusEl.textContent = 'Ready';
 
         const actionRow = document.createElement('div');
         actionRow.className = 'dl-action-row';
@@ -1268,56 +1293,65 @@ function startDownload(m3u8Url, title) {
         saveBtn.className = 'dl-save-btn';
         saveBtn.textContent = 'Save';
         saveBtn.addEventListener('click', function() {
-            saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving…';
-            triggerSave(jobId, safeTitle, saveBtn);
+            triggerSave(saveBtn);
         });
         actionRow.appendChild(saveBtn);
         item.appendChild(actionRow);
     }
 
-    // 1. Kick off the job (returns instantly)
-    const params = 'url=' + encodeURIComponent(m3u8Url) + '&title=' + encodeURIComponent(title);
-    fetch('/download_mp4?' + params)
+    // Poll /download_ready in "peek" mode (status only, doesn't consume the
+    // file) every 2 s until the server-side job finishes or errors.
+    let pollTimer = null;
+    function poll() {
+        fetch('/download_ready?job_id=' + encodeURIComponent(jobId) + '&peek=1')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'pending') {
+                    statusEl.textContent = 'Downloading…';
+                    if (d.pct != null) setProgress(d.pct);
+                    pollTimer = setTimeout(poll, 2000);
+                } else if (d.status === 'done') {
+                    showDownloadReady();
+                } else if (d.status === 'unknown') {
+                    setError('job no longer exists on server');
+                } else {
+                    setError(d.msg || 'unknown error');
+                }
+            })
+            .catch(function() {
+                // transient network glitch — keep polling
+                pollTimer = setTimeout(poll, 3000);
+            });
+    }
+    poll();
+}
+
+function startDownload(m3u8Url, title) {
+    fetch('/download_mp4?url=' + encodeURIComponent(m3u8Url) + '&title=' + encodeURIComponent(title))
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            if (!data.job_id) { setError('no job_id returned'); return; }
-            const jobId     = data.job_id;
-            const safeTitle = title.replace(/[^A-Za-z0-9 ._-]/g, '').trim() || 'video';
-            statusEl.textContent = 'Downloading…';
-
-            // 2. Poll /download_ready every 2 s until the server-side job
-            // finishes. Once it's done we stop polling and show a manual
-            // "Download to device" button instead of auto-saving.
-            let pollTimer = null;
-            function poll() {
-                fetch('/download_ready?job_id=' + encodeURIComponent(jobId) + '&peek=1')
-                    .then(function(r) {
-                        return r.json().then(function(d) {
-                            if (d.status === 'pending') {
-                                if (d.pct != null) setProgress(d.pct);
-                                pollTimer = setTimeout(poll, 2000);
-                            } else if (d.status === 'done') {
-                                showDownloadReady(jobId, safeTitle);
-                            } else {
-                                setError(d.msg || 'unknown error');
-                            }
-                        });
-                    })
-                    .catch(function(err) {
-                        // transient network glitch — keep polling
-                        pollTimer = setTimeout(poll, 3000);
-                    });
-            }
-            pollTimer = setTimeout(poll, 2000);
+            if (!data.job_id) { alert('Failed to start download'); return; }
+            rememberJob(data.job_id, title);
+            trackJob(data.job_id, title);
         })
-        .catch(function(err) { setError(String(err)); });
+        .catch(function(err) { alert('Failed to start download: ' + err); });
 }
 
 downloadBtn.addEventListener('click', function(){
-    if(!currentM3u8Url){ alert('Load a video first'); return; }
-    startDownload(currentM3u8Url, currentTitle || 'video');
+    const originalText = downloadBtn.textContent;
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = 'Loading…';
+    resolveAndPlay().then(function(m3u8){
+        downloadBtn.disabled = false;
+        downloadBtn.textContent = originalText;
+        if(!m3u8) return; // resolveAndPlay already alerted on failure
+        startDownload(currentM3u8Url, currentTitle || 'video');
+    });
 });
+
+// Reconnect to any downloads that were started before this page load (e.g.
+// the tab was closed or backgrounded while the server kept working).
+getActiveJobs().forEach(function(j){ trackJob(j.job_id, j.title); });
 </script>
 </body>
 </html>
