@@ -981,8 +981,8 @@ body::before {
   width: 150vw; height: 150vh;
   background-color: var(--bg);
   background-image:
-    radial-gradient(circle at 15% 20%, rgba(0,229,229,0.07), transparent 60%),
-    radial-gradient(circle at 85% 100%, rgba(0,229,229,0.05), transparent 60%);
+    radial-gradient(circle at 15% 0%, rgba(0,229,229,0.07), transparent 45%),
+    radial-gradient(circle at 85% 100%, rgba(0,229,229,0.05), transparent 40%);
   z-index: -1;
   pointer-events: none;
 }
