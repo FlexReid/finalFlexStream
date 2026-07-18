@@ -926,110 +926,212 @@ PLAYER_HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0c0c0e">
 <title>Flex Stream</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
+* { box-sizing: border-box; }
+:root {
+  --bg: #0c0c0e;
+  --bg-elevated: #17171a;
+  --bg-elevated-2: #1e1e22;
+  --border: rgba(255,255,255,0.08);
+  --border-soft: rgba(255,255,255,0.06);
+  --cyan: #00e5e5;
+  --cyan-bright: cyan;
+  --cyan-dim: #00cccc;
+  --text: #f2f2f4;
+  --text-dim: #9a9aa2;
+  --text-faint: #6b6b74;
+  --danger: #ff6b6b;
+  --radius: 14px;
+  --radius-sm: 10px;
+}
+html {
+  scrollbar-color: var(--border) transparent;
+  background-color: var(--bg);
+  height: 100%;
+}
 body {
   margin: 0;
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  background: #121212;
-  color: #fff;
+  font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: transparent;
+  color: var(--text);
   display: flex;
   flex-direction: column;
   align-items: center;
-  min-height: 100vh;
-  padding: 20px;
+  min-height: 100%;
+  padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+  position: relative;
 }
-h1 { margin-bottom: 10px; font-weight: 600; }
-h1 .cyan { color: cyan; }
+/* Oversized backdrop: bigger than the viewport in every direction and
+   pinned with position:fixed, so no matter how far a browser's bounce/
+   rubber-band overscroll goes, it's still showing this layer rather than
+   revealing bare black underneath. */
+body::before {
+  content: '';
+  position: fixed;
+  top: -25vh; left: -25vw;
+  width: 150vw; height: 150vh;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle at 15% 20%, rgba(0,229,229,0.07), transparent 60%),
+    radial-gradient(circle at 85% 100%, rgba(0,229,229,0.05), transparent 60%);
+  z-index: -1;
+  pointer-events: none;
+}
+h1 {
+  margin: 0 0 26px;
+  font-weight: 800;
+  font-size: 1.9rem;
+  letter-spacing: -0.02em;
+  display: flex; align-items: center; gap: 2px;
+}
+h1 .cyan {
+  color: var(--cyan-bright);
+  text-shadow: 0 0 22px rgba(0,255,255,0.35);
+}
 #controls {
-  display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px;
+  display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 22px;
   width: 100%; max-width: 900px; justify-content: center;
+  background: linear-gradient(180deg, var(--bg-elevated), rgba(23,23,26,0.6));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.35);
 }
 input, select {
-  padding: 10px; border-radius: 6px; border: none;
-  flex: 1 1 150px; max-width: 250px; font-size: 1rem;
+  padding: 11px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  flex: 1 1 150px; max-width: 250px; font-size: 16px;
+  background: var(--bg-elevated-2); color: var(--text);
+  font-family: inherit; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  outline: none;
 }
+input::placeholder { color: var(--text-faint); }
+input:focus, select:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(0,229,229,0.15);
+}
+select { cursor: pointer; }
+/* Swapped box treatment: title input is now the light box, season/episode keep the dark box */
+#title {
+  background: #eef1f2;
+  color: #14181a;
+}
+#title::placeholder { color: #6b7378; }
 button {
-  padding: 10px 20px; background-color: cyan; color: #000;
-  border: none; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s;
+  padding: 11px 22px; background: linear-gradient(135deg, var(--cyan-bright), var(--cyan-dim));
+  color: #000;
+  border: none; border-radius: var(--radius-sm); cursor: pointer; font-weight: 700; font-size: 0.95rem;
+  font-family: inherit;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+  box-shadow: 0 4px 14px rgba(0,229,229,0.22);
 }
-button:hover { background-color: #00cccc; }
-#video-container { position: relative; width: 80%; max-width: 900px; }
-#downloadBtn { margin-top: 16px; }
-#downloadBtn:disabled { background-color: #555; color: #999; cursor: not-allowed; }
+button:hover { filter: brightness(1.06); box-shadow: 0 6px 20px rgba(0,229,229,0.32); transform: translateY(-1px); }
+button:active { transform: translateY(0); }
+#video-container {
+  position: relative; width: 80%; max-width: 900px;
+  border-radius: var(--radius); overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  border: 1px solid var(--border);
+}
+#downloadBtn { margin-top: 18px; }
+#downloadBtn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; box-shadow: none; transform: none; filter: none; }
 #downloads-panel {
-  width: 80%; max-width: 900px; margin-top: 12px;
+  width: 80%; max-width: 900px; margin-top: 14px;
   display: flex; flex-direction: column; gap: 10px;
 }
 .download-item {
-  background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 10px 14px;
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg));
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 16px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
 }
 .download-item .dl-title-row {
   display: flex; justify-content: space-between; align-items: center;
-  font-size: 0.9rem; margin-bottom: 6px; gap: 10px;
+  font-size: 0.9rem; margin-bottom: 8px; gap: 10px;
 }
-.download-item .dl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-.download-item .dl-status { color: #aaa; font-size: 0.8rem; white-space: nowrap; }
-.download-item .dl-status.error { color: #ff6b6b; }
-.download-item .dl-status.done  { color: cyan; }
-.download-item .dl-bar-track { width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
-.download-item .dl-bar-fill  { height: 100%; background: cyan; width: 0%; transition: width 0.2s ease; }
+.download-item .dl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-weight: 500; }
+.download-item .dl-status { color: var(--text-dim); font-size: 0.78rem; white-space: nowrap; font-weight: 500; }
+.download-item .dl-status.error { color: var(--danger); }
+.download-item .dl-status.done  { color: var(--cyan-bright); }
+.download-item .dl-bar-track { width: 100%; height: 6px; background: var(--bg-elevated-2); border-radius: 4px; overflow: hidden; }
+.download-item .dl-bar-fill  { height: 100%; background: linear-gradient(90deg, var(--cyan-dim), var(--cyan-bright)); width: 0%; transition: width 0.2s ease; }
 .download-item .dl-bar-fill.indeterminate { width: 30%; animation: dl-indeterminate 1.2s ease-in-out infinite; }
 @keyframes dl-indeterminate { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
-.download-item .dl-action-row { margin-top: 8px; text-align: right; }
+.download-item .dl-action-row { margin-top: 10px; text-align: right; }
 .download-item .dl-save-btn {
-  padding: 6px 14px; background-color: cyan; color: #000; border: none;
-  border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem;
+  padding: 7px 16px; background: linear-gradient(135deg, var(--cyan-bright), var(--cyan-dim)); color: #000; border: none;
+  border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 0.82rem;
+  font-family: inherit; transition: transform 0.15s ease, filter 0.15s ease;
 }
-.download-item .dl-save-btn:hover { background-color: #00cccc; }
-.download-item .dl-save-btn:disabled { background-color: #555; color: #999; cursor: not-allowed; }
-#video { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 16 / 9; }
+.download-item .dl-save-btn:hover { filter: brightness(1.06); transform: translateY(-1px); }
+.download-item .dl-save-btn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; transform: none; filter: none; }
+#video { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; }
 #loading {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  color: #fff; font-size: 20px; background: rgba(0,0,0,0.6);
-  padding: 12px 20px; border-radius: 6px; display: none;
+  color: #fff; font-size: 1rem; font-weight: 500; background: rgba(10,10,12,0.75);
+  backdrop-filter: blur(6px);
+  padding: 14px 22px; border-radius: 10px; display: none;
+  border: 1px solid var(--border);
 }
 #debug-overlay {
-  position: absolute; top: 10px; left: 10px; color: cyan; font-size: 12px;
-  font-family: monospace; background-color: rgba(0,0,0,0.3); padding: 4px 8px;
-  border-radius: 4px; pointer-events: none; z-index: 100; white-space: pre-line;
+  position: absolute; top: 12px; left: 12px; color: var(--cyan-bright); font-size: 11px;
+  font-family: 'SFMono-Regular', Menlo, monospace; background-color: rgba(0,0,0,0.4); padding: 5px 10px;
+  border-radius: 6px; pointer-events: none; z-index: 100; white-space: pre-line;
+  backdrop-filter: blur(4px);
 }
 #quality {
-  position: absolute; top: 10px; right: 10px; z-index: 100;
-  background-color: rgba(0,0,0,0.65); color: #fff; border: 1px solid rgba(255,255,255,0.3);
-  border-radius: 6px; padding: 6px 10px; font-size: 0.85rem; max-width: 110px; cursor: pointer;
+  position: absolute; top: 12px; right: 12px; z-index: 100;
+  background-color: rgba(10,10,12,0.7); color: #fff; border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px; padding: 7px 12px; font-size: 0.82rem; max-width: 110px; cursor: pointer;
+  font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
+  transition: background-color 0.15s ease;
 }
-#quality:hover { background-color: rgba(0,0,0,0.85); }
+#quality:hover { background-color: rgba(10,10,12,0.9); }
 .autocomplete-dropdown {
-  position: absolute; background: #222; color: #fff; list-style: none;
-  padding: 5px; margin: 0; border-radius: 4px; z-index: 1000; display: none;
+  position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
+  padding: 6px; margin: 0; border-radius: var(--radius-sm); z-index: 1000; display: none;
+  border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,0.45);
 }
-.autocomplete-dropdown li { cursor: pointer; padding: 3px 6px; }
-footer { margin-top: auto; text-align: center; padding: 10px; font-size: 0.9rem; color: #888; }
+.autocomplete-dropdown li { cursor: pointer; padding: 7px 10px; border-radius: 6px; font-size: 0.9rem; transition: background-color 0.1s ease; }
+.autocomplete-dropdown li:hover { background: rgba(0,229,229,0.12); }
+footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 10px 10px; font-size: 0.82rem; color: var(--text-faint); }
 @media (max-width: 768px) {
   #controls { flex-direction: column; align-items: stretch; gap: 10px; }
-  #controls input, #controls select, #controls button {
+  #controls input, #controls select {
     flex: none; width: 100%; max-width: 100%; box-sizing: border-box;
-    text-align: center; text-align-last: center; color: #000;
+    text-align: center; text-align-last: center; color: var(--text);
+  }
+  #controls button {
+    flex: none; width: 100%; max-width: 100%; box-sizing: border-box;
+    text-align: center; color: #000;
   }
   #video-container { width: 98%; max-width: 100%; }
   #video-container video {
     width: 100%; height: 35vh; max-height: 40vh; margin: 0 auto;
-    display: block; object-fit: contain; border-radius: 8px;
+    display: block; object-fit: contain;
   }
   #downloads-panel { width: 98%; }
   footer { margin-top: 10px; margin-bottom: 20px; }
-  #controls button { width: 50%; min-height: 60px; padding: 0; align-self: center; font-size: 1.5rem; }
+  #controls button { width: 50%; min-height: 60px; padding: 0; align-self: center; font-size: 1.4rem; }
   #controls .select-wrapper { position: relative; width: 100%; }
   #controls select {
     -webkit-appearance: none !important; appearance: none !important;
-    width: 100%; padding: 10px; text-align: center; text-align-last: center;
-    background: #e5e5e5; color: #000; border: none; border-radius: 6px; box-sizing: border-box;
+    width: 100%; padding: 11px; text-align: center; text-align-last: center;
+    background: var(--bg-elevated-2); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); box-sizing: border-box;
+  }
+  #controls #title {
+    background: #eef1f2;
+    color: #14181a;
   }
   #loading {
-    font-size: 16px; padding: 10px 16px; border-radius: 6px; background: rgba(0,0,0,0.6);
+    font-size: 15px; padding: 10px 16px; border-radius: 10px; background: rgba(10,10,12,0.75);
     color: #fff; display: none; text-align: center; max-width: 90%; box-sizing: border-box;
   }
 }
@@ -1052,7 +1154,7 @@ footer { margin-top: auto; text-align: center; padding: 10px; font-size: 0.9rem;
 </div>
 <button id="downloadBtn">Download MP4</button>
 <div id="downloads-panel"></div>
-<footer>Powered by <span class="cyan">Flex</span> Stream</footer>
+<footer>v2.0</footer>
 <script>
 const video        = document.getElementById('video');
 const loading      = document.getElementById('loading');
@@ -1067,6 +1169,16 @@ let hlsInstance    = null;
 let selectedTmdbId = null;
 let currentM3u8Url = null;
 let currentTitle   = null;
+let lastKnownTime  = 0;
+let recoveryInProgress = false;
+let loadedQueryKey = null;
+
+function currentQueryKey(){
+    const {title,year}=parseTitleAndYear(titleInput.value.trim());
+    return [title.trim().toLowerCase(), year||'', seasonSelect.value||'', episodeSelect.value||''].join('|');
+}
+
+video.addEventListener('timeupdate', () => { lastKnownTime = video.currentTime; });
 
 function showLoading(show){ loading.style.display = show ? 'block' : 'none'; }
 function updateDebug(msg){ debugOverlay.textContent = msg; }
@@ -1186,6 +1298,7 @@ function resolveAndPlay(){
         if(!m3u8){ updateDebug('No video found'); alert('No video found'); return null; }
         updateDebug('Video URL captured. Loading HLS...');
         currentM3u8Url=m3u8;
+        loadedQueryKey=[title.trim().toLowerCase(), year||'', season||'', episode||''].join('|');
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
         const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
@@ -1199,7 +1312,26 @@ function resolveAndPlay(){
                 const lvl=hlsInstance.levels[data.level];
                 if(lvl) updateDebug('Playing: '+levelLabel(lvl)+(qualitySelect.value==='-1'?' (auto)':''));
             });
-            hlsInstance.on(Hls.Events.ERROR,(e,data)=>{ console.error('Hls.js error:',data); });
+            hlsInstance.on(Hls.Events.ERROR,(e,data)=>{
+                console.error('Hls.js error:', data);
+                if (!data.fatal) return;
+                switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        updateDebug('Network hiccup, recovering...');
+                        hlsInstance.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        updateDebug('Playback hiccup, recovering...');
+                        hlsInstance.recoverMediaError();
+                        break;
+                    default:
+                        // Not internally recoverable (e.g. the stream's signed URL
+                        // expired). Re-resolve a fresh stream and pick up where we
+                        // left off, instead of just dying silently.
+                        reresolveAndResume();
+                        break;
+                }
+            });
         } else if(video.canPlayType('application/vnd.apple.mpegurl')){
             qualitySelect.style.display='none';
             video.src=proxied;
@@ -1212,6 +1344,45 @@ function resolveAndPlay(){
 function load(){
     resolveAndPlay();
 }
+
+// ── Auto-recovery after backgrounding ───────────────────────────────────
+// If the tab/phone is backgrounded for a while, the stream's signed m3u8
+// URL can expire, or the connection can just drop. Previously this showed
+// a dead player and required manually hitting Load & Play again. Now we
+// detect it and quietly re-resolve + resume at the same spot.
+function isStreamBroken(){
+    if (!currentM3u8Url) return false;
+    if (video.error) return true;
+    if (video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) return true;
+    return false;
+}
+
+function reresolveAndResume(){
+    if (recoveryInProgress || !currentM3u8Url) return;
+    recoveryInProgress = true;
+    const resumeTime = lastKnownTime;
+    updateDebug('Reconnecting...');
+    resolveAndPlay().then(function(m3u8){
+        recoveryInProgress = false;
+        if (!m3u8 || resumeTime <= 1) return;
+        const seekWhenReady = function(){
+            video.currentTime = resumeTime;
+            video.play().catch(()=>{});
+        };
+        if (video.readyState >= 1) seekWhenReady();
+        else video.addEventListener('loadedmetadata', seekWhenReady, { once: true });
+    }).catch(function(){ recoveryInProgress = false; });
+}
+
+document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState !== 'visible') return;
+    if (!currentM3u8Url || recoveryInProgress) return;
+    // Give the browser a moment to report its real state after resuming
+    // before deciding the stream actually broke.
+    setTimeout(function(){
+        if (isStreamBroken()) reresolveAndResume();
+    }, 500);
+});
 
 // ── Download ─────────────────────────────────────────────────────────────
 // The actual fetch+remux work happens entirely server-side in a background
@@ -1274,12 +1445,18 @@ function trackJob(jobId, title) {
 
         statusEl.classList.add('done');
         statusEl.textContent = "Saving";
-        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        if (btn) { btn.disabled = true; }
 
-        // We can't get a JS completion callback for a native download, so
-        // we don't assume success here — the server only deletes the file
-        // once it has actually streamed every byte, and this item stays
-        // available (up to the retention cap) in case you need to retry.
+        // The browser has now taken over the transfer to disk. We no longer
+        // need to track this job client-side, so drop it from localStorage
+        // and remove its card from the page — there's nothing further to
+        // poll or retry from here (the browser's own download manager owns
+        // the rest of the transfer).
+        forgetJob(jobId);
+        if (pollTimer) clearTimeout(pollTimer);
+        item.style.transition = 'opacity 0.3s ease';
+        item.style.opacity = '0';
+        setTimeout(function() { item.remove(); }, 300);
     }
 
     function showDownloadReady() {
@@ -1338,6 +1515,11 @@ function startDownload(m3u8Url, title) {
 }
 
 downloadBtn.addEventListener('click', function(){
+    const alreadyLoaded = currentM3u8Url && !isStreamBroken() && loadedQueryKey === currentQueryKey();
+    if (alreadyLoaded) {
+        startDownload(currentM3u8Url, currentTitle || 'video');
+        return;
+    }
     const originalText = downloadBtn.textContent;
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Loading…';
