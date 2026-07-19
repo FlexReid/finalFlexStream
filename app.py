@@ -1542,32 +1542,7 @@ function getStreamCache(){
 function attachStream(m3u8, resumeAt, onReady, onFail){
     const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
     let readyFired=false;
-    // Safari's native HLS engine is preferred over hls.js when available.
-    // hls.js works by feeding the video element through MediaSource
-    // Extensions (MSE); Safari's AirPlay can only mirror *audio* from an
-    // MSE-backed video (it can't hand the video track off to the Apple TV
-    // for genuine "video plays remotely, phone stays free" AirPlay). Only
-    // Safari's own native HLS pipeline supports full video+audio AirPlay,
-    // so on browsers that offer it we use it instead of hls.js. hls.js is
-    // still the right choice everywhere else (Chrome, Firefox, etc. have
-    // no native HLS support and no AirPlay to lose).
-    const nativeHlsSupport = video.canPlayType('application/vnd.apple.mpegurl');
-    if(nativeHlsSupport){
-        qualitySelect.style.display='none';
-        video.src=proxied;
-        video.addEventListener('loadedmetadata',function onMeta(){
-            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
-            video.play().catch(()=>{});
-            video.removeEventListener('loadedmetadata', onMeta);
-            readyFired=true;
-            if(onReady) onReady();
-        });
-        video.addEventListener('error', function onErr(){
-            video.removeEventListener('error', onErr);
-            if (!readyFired && onFail) onFail();
-            else reresolveAndResume();
-        }, { once: true });
-    } else if(Hls.isSupported()){
+    if(Hls.isSupported()){
         if(hlsInstance) hlsInstance.destroy();
         hlsInstance=new Hls();
         hlsInstance.loadSource(proxied);
@@ -1602,6 +1577,20 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
                     break;
             }
         });
+    } else if(video.canPlayType('application/vnd.apple.mpegurl')){
+        qualitySelect.style.display='none';
+        video.src=proxied;
+        video.addEventListener('loadedmetadata',function onMeta(){
+            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
+            video.play().catch(()=>{});
+            video.removeEventListener('loadedmetadata', onMeta);
+            readyFired=true;
+            if(onReady) onReady();
+        });
+        video.addEventListener('error', function onErr(){
+            video.removeEventListener('error', onErr);
+            if (!readyFired && onFail) onFail();
+        }, { once: true });
     } else {
         updateDebug('HLS not supported in this browser');
         if (onFail) onFail(); else alert('HLS not supported in this browser');
