@@ -513,10 +513,11 @@ def proxy_playlist():
     if cached and now - cached['ts'] < CACHE_TTL:
         return Response(cached['data'], mimetype="application/vnd.apple.mpegurl")
     try:
-        # A couple of quick retries absorbs the rare transient 5xx/524
-        # (origin timeout) blip from the upstream CDN without ever
-        # surfacing an error to the player.
-        pl_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.75, headers=get_headers_for_stream(url))
+        # A few quick retries absorbs the rare transient 5xx/524 (origin
+        # timeout) blip from the upstream CDN, and also gives a
+        # freshly-issued token a little time to propagate/settle across the
+        # CDN's edge if it 403s immediately after being minted.
+        pl_bytes = fetch_bytes_retry(url, max_retries=3, base_delay=1.0, headers=get_headers_for_stream(url))
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
     pl_text = pl_bytes.decode('utf-8', errors='ignore')
@@ -539,7 +540,12 @@ def segment():
         return "Missing u param", 400
     url = unquote_plus(u)
     try:
-        remote_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.5, headers=get_headers_for_stream(url))
+        # Fail fast here (short single retry) rather than a slow backoff —
+        # native players (AVPlayer etc.) already retry a failed segment
+        # fetch on their own shortly after, so it's better for us to
+        # respond quickly and let the player's own retry catch it than to
+        # add several more seconds of server-side backoff on top.
+        remote_bytes = fetch_bytes_retry(url, max_retries=1, base_delay=0.3, headers=get_headers_for_stream(url))
         remote_bytes = extract_ts_packets(remote_bytes)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
@@ -1140,6 +1146,27 @@ def get_prescraped():
     return jsonify({"status": entry["status"]})
 
 
+@app.route("/invalidate_prescraped")
+def invalidate_prescraped():
+    """Drops a specific prescrape cache entry. Called by the client when a
+    prescraped/cached m3u8 turns out to be dead on arrival (e.g. the
+    upstream 403'd it), so nobody else gets served that same broken link
+    before its normal TTL would have expired it."""
+    tmdb_id = request.args.get("tmdb_id")
+    season = request.args.get("season")
+    episode = request.args.get("episode")
+    if not tmdb_id or not season or not episode:
+        return jsonify({"status": "invalid"}), 400
+    try:
+        tmdb_id, season, episode = int(tmdb_id), int(season), int(episode)
+    except ValueError:
+        return jsonify({"status": "invalid"}), 400
+    key = _prescrape_key(tmdb_id, season, episode)
+    with _prescrape_lock:
+        _prescrape_cache.pop(key, None)
+    return jsonify({"status": "ok"})
+
+
 PLAYER_HTML = """<!doctype html>
 <html>
 <head>
@@ -1721,10 +1748,19 @@ function resolveAndPlay(resumeAt){
     if(episode) currentTitle+='E'+episode;
     showLoading(true); updateDebug('Searching TMDb...'); qualitySelect.style.display='none';
 
-    function finish(m3u8){
+    function fullScrape(){
+        let url='/get_m3u8?title='+encodeURIComponent(title);
+        if(year) url+='&year='+year;
+        if(season) url+='&season='+season;
+        if(episode) url+='&episode='+episode;
+        return fetch(url).then(r=>r.text()).then(function(m3u8){ return finish(m3u8, false); })
+            .catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
+    }
+
+    function finish(m3u8, fromCache){
         showLoading(false);
         if(!m3u8){ updateDebug('No video found'); alert('No video found'); return null; }
-        updateDebug('Video URL captured. Loading HLS...');
+        updateDebug(fromCache ? 'Using preloaded stream...' : 'Video URL captured. Loading HLS...');
         currentM3u8Url=m3u8;
         loadedQueryKey=queryKey;
         loadedTmdbId=selectedTmdbId||null;
@@ -1737,17 +1773,34 @@ function resolveAndPlay(resumeAt){
         addRecent(titleInput.value.trim()||title);
         saveStreamCache(m3u8, currentTitle, loadedQueryKey);
         updateMediaSessionMetadata(currentTitle);
-        attachStream(m3u8, resumeAt);
-        return m3u8;
-    }
 
-    function fullScrape(){
-        let url='/get_m3u8?title='+encodeURIComponent(title);
-        if(year) url+='&year='+year;
-        if(season) url+='&season='+season;
-        if(episode) url+='&episode='+episode;
-        return fetch(url).then(r=>r.text()).then(finish)
-            .catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
+        // If playback never actually starts (attachStream's onFail), don't
+        // just leave a dead player sitting there. A cached/prescraped link
+        // in particular can be stale (e.g. the upstream 403'd it) — reusing
+        // the exact same link on a manual retry would reproduce the
+        // identical failure instantly, which is confusing. So: drop that
+        // specific cache entry and get a genuinely fresh scrape once,
+        // automatically, instead of making the person notice and retry.
+        let retriedFresh = false;
+        showLoading(true);
+        attachStream(m3u8, resumeAt, function onReady(){
+            showLoading(false);
+        }, function onFail(){
+            if (fromCache && !retriedFresh) {
+                retriedFresh = true;
+                if (loadedTmdbId && season && episode) {
+                    fetch('/invalidate_prescraped?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(season)+'&episode='+encodeURIComponent(episode)).catch(()=>{});
+                }
+                updateDebug('Preloaded stream failed, fetching a fresh one...');
+                showLoading(true);
+                fullScrape();
+                return;
+            }
+            showLoading(false);
+            updateDebug('Playback failed to start');
+            alert('Playback failed to start. Please try Load & Play again.');
+        });
+        return m3u8;
     }
 
     // If this exact episode was already prescraped in the background while
@@ -1757,8 +1810,7 @@ function resolveAndPlay(resumeAt){
         const preUrl='/get_prescraped?tmdb_id='+encodeURIComponent(selectedTmdbId)+'&season='+encodeURIComponent(season)+'&episode='+encodeURIComponent(episode);
         return fetch(preUrl).then(r=>r.json()).then(function(pre){
             if (pre && pre.status==='done' && pre.m3u8) {
-                updateDebug('Using preloaded stream...');
-                return finish(pre.m3u8);
+                return finish(pre.m3u8, true);
             }
             return fullScrape();
         }).catch(fullScrape);
@@ -1853,6 +1905,26 @@ document.addEventListener('visibilitychange', function(){
     }, 500);
 });
 
+// ── Stall watchdog ───────────────────────────────────────────────────────
+// A player that's already playing can still get stuck mid-stream (e.g. a
+// segment 403s). Native players usually self-heal from a brief stall by
+// skipping ahead a few seconds — that's normal and left alone. But if it's
+// stuck for a long stretch (10s+) rather than the usual brief blip, that's
+// worth actually recovering from rather than leaving the viewer stuck.
+let stallTimer = null;
+video.addEventListener('waiting', function(){
+    if (stallTimer || !currentM3u8Url) return;
+    stallTimer = setTimeout(function(){
+        stallTimer = null;
+        if (video.paused || video.readyState < 3) {
+            updateDebug('Stalled, attempting recovery...');
+            reresolveAndResume();
+        }
+    }, 10000);
+});
+video.addEventListener('playing', function(){
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+});
 
 // ── Download ─────────────────────────────────────────────────────────────
 // The actual fetch+remux work happens entirely server-side in a background
