@@ -501,10 +501,21 @@ def proxy_playlist():
     if cached and now - cached['ts'] < CACHE_TTL:
         return Response(cached['data'], mimetype="application/vnd.apple.mpegurl")
     try:
-        pl_bytes = fetch_bytes(url)
+        # A couple of quick retries absorbs the rare transient 5xx/524
+        # (origin timeout) blip from the upstream CDN without ever
+        # surfacing an error to the player.
+        pl_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.75)
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
     pl_text = pl_bytes.decode('utf-8', errors='ignore')
+    if not pl_text.lstrip().startswith('#EXTM3U'):
+        # The upstream didn't actually return a playlist (e.g. a Cloudflare
+        # error page). Refuse to rewrite/serve it as if it were valid HLS
+        # content — that was corrupting the response and confusing hls.js.
+        # Returning a clean error here lets hls.js's own fragment/manifest
+        # error+retry handling do the right thing instead.
+        debug(f"[proxy_playlist] Upstream did not return a valid playlist for {url}")
+        return "Upstream did not return a valid playlist", 502
     rewritten = rewrite_playlist(url, pl_text)
     _playlist_cache[url] = {'data': rewritten, 'ts': now}
     return Response(rewritten, mimetype="application/vnd.apple.mpegurl")
@@ -516,7 +527,7 @@ def segment():
         return "Missing u param", 400
     url = unquote_plus(u)
     try:
-        remote_bytes = fetch_bytes(url)
+        remote_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.5)
         remote_bytes = extract_ts_packets(remote_bytes)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
@@ -1275,12 +1286,89 @@ seasonSelect.addEventListener('change',()=>{
 
 function parseTitleAndYear(f){ const m=f.match(/^(.*)\s+\((\d{4})\)$/); return m?{title:m[1],year:m[2]}:{title:f,year:null}; }
 
-function resolveAndPlay(){
+// ── Stream cache ─────────────────────────────────────────────────────────
+// Whenever a stream loads successfully we remember its m3u8 URL. If the
+// player later errors out, the fastest fix is usually to just re-attach to
+// this same URL (most errors are transient upstream hiccups, not an
+// actually-expired link) — only falling back to a full TMDb search + scrape
+// (10-30s) when re-attaching also fails. Kept in localStorage (not just a
+// JS variable) so it also survives the tab being fully reloaded/killed
+// while backgrounded, not just briefly suspended.
+const STREAM_CACHE_KEY = 'flexstream_last_stream';
+function saveStreamCache(m3u8, title, queryKey){
+    try{ localStorage.setItem(STREAM_CACHE_KEY, JSON.stringify({ m3u8, title, queryKey, ts: Date.now() })); }catch(e){}
+}
+function getStreamCache(){
+    try{ const r=localStorage.getItem(STREAM_CACHE_KEY); return r?JSON.parse(r):null; }catch(e){ return null; }
+}
+
+// Shared attach logic for both a freshly-resolved URL and a cached one.
+// onReady()/onFail() let callers (quick reattach vs. full resolve) react
+// differently to success/failure instead of duplicating the hls.js wiring.
+function attachStream(m3u8, resumeAt, onReady, onFail){
+    const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
+    let readyFired=false;
+    if(Hls.isSupported()){
+        if(hlsInstance) hlsInstance.destroy();
+        hlsInstance=new Hls();
+        hlsInstance.loadSource(proxied);
+        hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.MANIFEST_PARSED,(event,data)=>{
+            populateQualityLevels(data.levels);
+            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
+            video.play().catch(()=>{});
+            readyFired=true;
+            if(onReady) onReady();
+        });
+        hlsInstance.on(Hls.Events.LEVEL_SWITCHED,(event,data)=>{
+            const lvl=hlsInstance.levels[data.level];
+            if(lvl) updateDebug('Playing: '+levelLabel(lvl)+(qualitySelect.value==='-1'?' (auto)':''));
+        });
+        hlsInstance.on(Hls.Events.ERROR,(e,data)=>{
+            console.error('Hls.js error:', data);
+            if (!data.fatal) return;
+            switch (data.type) {
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                    updateDebug('Network hiccup, recovering...');
+                    hlsInstance.startLoad();
+                    break;
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                    updateDebug('Playback hiccup, recovering...');
+                    hlsInstance.recoverMediaError();
+                    break;
+                default:
+                    // Not internally recoverable by hls.js itself.
+                    if (!readyFired && onFail) onFail();
+                    else reresolveAndResume();
+                    break;
+            }
+        });
+    } else if(video.canPlayType('application/vnd.apple.mpegurl')){
+        qualitySelect.style.display='none';
+        video.src=proxied;
+        video.addEventListener('loadedmetadata',function onMeta(){
+            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
+            video.play().catch(()=>{});
+            video.removeEventListener('loadedmetadata', onMeta);
+            readyFired=true;
+            if(onReady) onReady();
+        });
+        video.addEventListener('error', function onErr(){
+            video.removeEventListener('error', onErr);
+            if (!readyFired && onFail) onFail();
+        }, { once: true });
+    } else {
+        updateDebug('HLS not supported in this browser');
+        if (onFail) onFail(); else alert('HLS not supported in this browser');
+    }
+}
+
+function resolveAndPlay(resumeAt){
     // Resolves whatever is currently in the title/season/episode fields,
     // starts it playing, and returns a Promise of the resolved m3u8 URL (or
-    // null on failure). Used by both the Load & Play button and the
-    // Download button, so downloading no longer requires a separate load
-    // step first.
+    // null on failure). Used by the Load & Play button, the Download
+    // button, and as the fallback path when a cached-URL quick reattach
+    // fails, so downloading/recovery never need a separate load step first.
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
     if(!title){ alert('Enter a title'); return Promise.resolve(null); }
     const season=seasonSelect.value, episode=episodeSelect.value;
@@ -1301,42 +1389,8 @@ function resolveAndPlay(){
         loadedQueryKey=[title.trim().toLowerCase(), year||'', season||'', episode||''].join('|');
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
-        const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
-        if(Hls.isSupported()){
-            if(hlsInstance) hlsInstance.destroy();
-            hlsInstance=new Hls();
-            hlsInstance.loadSource(proxied);
-            hlsInstance.attachMedia(video);
-            hlsInstance.on(Hls.Events.MANIFEST_PARSED,(event,data)=>{ populateQualityLevels(data.levels); video.play().catch(()=>{}); });
-            hlsInstance.on(Hls.Events.LEVEL_SWITCHED,(event,data)=>{
-                const lvl=hlsInstance.levels[data.level];
-                if(lvl) updateDebug('Playing: '+levelLabel(lvl)+(qualitySelect.value==='-1'?' (auto)':''));
-            });
-            hlsInstance.on(Hls.Events.ERROR,(e,data)=>{
-                console.error('Hls.js error:', data);
-                if (!data.fatal) return;
-                switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR:
-                        updateDebug('Network hiccup, recovering...');
-                        hlsInstance.startLoad();
-                        break;
-                    case Hls.ErrorTypes.MEDIA_ERROR:
-                        updateDebug('Playback hiccup, recovering...');
-                        hlsInstance.recoverMediaError();
-                        break;
-                    default:
-                        // Not internally recoverable (e.g. the stream's signed URL
-                        // expired). Re-resolve a fresh stream and pick up where we
-                        // left off, instead of just dying silently.
-                        reresolveAndResume();
-                        break;
-                }
-            });
-        } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-            qualitySelect.style.display='none';
-            video.src=proxied;
-            video.addEventListener('loadedmetadata',()=>{ video.play().catch(()=>{}); });
-        } else { updateDebug('HLS not supported in this browser'); alert('HLS not supported in this browser'); }
+        saveStreamCache(m3u8, currentTitle, loadedQueryKey);
+        attachStream(m3u8, resumeAt);
         return m3u8;
     }).catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
 }
@@ -1345,11 +1399,13 @@ function load(){
     resolveAndPlay();
 }
 
-// ── Auto-recovery after backgrounding ───────────────────────────────────
-// If the tab/phone is backgrounded for a while, the stream's signed m3u8
-// URL can expire, or the connection can just drop. Previously this showed
-// a dead player and required manually hitting Load & Play again. Now we
-// detect it and quietly re-resolve + resume at the same spot.
+// ── Auto-recovery ────────────────────────────────────────────────────────
+// If playback dies (a rare transient upstream hiccup) or the tab/phone was
+// backgrounded for a while (the stream's signed m3u8 URL can expire, or the
+// connection can just drop), this quietly recovers instead of showing a
+// dead player. It tries the fast path first — just re-attach to the same
+// cached m3u8 URL — and only pays for a full TMDb search + re-scrape if
+// that fails too (e.g. the link genuinely expired).
 function isStreamBroken(){
     if (!currentM3u8Url) return false;
     if (video.error) return true;
@@ -1358,20 +1414,34 @@ function isStreamBroken(){
 }
 
 function reresolveAndResume(){
-    if (recoveryInProgress || !currentM3u8Url) return;
+    if (recoveryInProgress) return;
     recoveryInProgress = true;
     const resumeTime = lastKnownTime;
-    updateDebug('Reconnecting...');
-    resolveAndPlay().then(function(m3u8){
-        recoveryInProgress = false;
-        if (!m3u8 || resumeTime <= 1) return;
-        const seekWhenReady = function(){
-            video.currentTime = resumeTime;
-            video.play().catch(()=>{});
-        };
-        if (video.readyState >= 1) seekWhenReady();
-        else video.addEventListener('loadedmetadata', seekWhenReady, { once: true });
-    }).catch(function(){ recoveryInProgress = false; });
+    const cached = getStreamCache();
+    const cachedUrl = currentM3u8Url || (cached && cached.m3u8);
+
+    function fullResolve(){
+        updateDebug('Reconnecting (full search)...');
+        resolveAndPlay(resumeTime).then(function(){ recoveryInProgress = false; })
+            .catch(function(){ recoveryInProgress = false; });
+    }
+
+    if (cachedUrl) {
+        updateDebug('Reconnecting...');
+        let settled = false;
+        attachStream(cachedUrl, resumeTime, function onReady(){
+            if (settled) return;
+            settled = true;
+            currentM3u8Url = cachedUrl;
+            recoveryInProgress = false;
+        }, function onFail(){
+            if (settled) return;
+            settled = true;
+            fullResolve();
+        });
+    } else {
+        fullResolve();
+    }
 }
 
 document.addEventListener('visibilitychange', function(){
@@ -1383,6 +1453,7 @@ document.addEventListener('visibilitychange', function(){
         if (isStreamBroken()) reresolveAndResume();
     }, 500);
 });
+
 
 // ── Download ─────────────────────────────────────────────────────────────
 // The actual fetch+remux work happens entirely server-side in a background
