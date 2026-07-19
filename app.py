@@ -543,8 +543,37 @@ def segment():
         remote_bytes = extract_ts_packets(remote_bytes)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
+
+    total_len = len(remote_bytes)
+
+    # Native HLS players (tvOS's AVPlayer in particular, used for true
+    # remote AirPlay playback rather than mirroring) sometimes probe or
+    # fetch segments with a Range header. Previously this was ignored and
+    # the full segment was always returned, which can make a strict client
+    # treat the source as broken/unsupported. Honor Range properly with a
+    # real 206 response when asked.
+    range_header = request.headers.get('Range')
+    if range_header:
+        m = re.match(r'bytes=(\d*)-(\d*)', range_header)
+        if m:
+            start_str, end_str = m.groups()
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else total_len - 1
+            end = min(end, total_len - 1)
+            if total_len == 0 or start > end or start >= total_len:
+                resp = Response(status=416)
+                resp.headers['Content-Range'] = f'bytes */{total_len}'
+                return resp
+            chunk = remote_bytes[start:end + 1]
+            resp = Response(chunk, status=206, mimetype="video/MP2T")
+            resp.headers['Content-Range'] = f'bytes {start}-{end}/{total_len}'
+            resp.headers['Accept-Ranges'] = 'bytes'
+            resp.headers['Content-Length'] = str(len(chunk))
+            return resp
+
     resp = Response(remote_bytes, mimetype="video/MP2T")
-    resp.headers['Content-Length'] = str(len(remote_bytes))
+    resp.headers['Content-Length'] = str(total_len)
+    resp.headers['Accept-Ranges'] = 'bytes'
     return resp
 
 WIDELY_SUPPORTED_VIDEO_CODECS = {"h264"}
@@ -635,8 +664,16 @@ def _cleanup_stale_jobs():
 threading.Thread(target=_cleanup_stale_jobs, daemon=True).start()
 
 
-def _run_download_job(job_id: str, url: str, title: str, dl_headers: dict):
-    """Runs entirely in a daemon thread — Flask is not involved."""
+def _run_download_job(job_id: str, url: str, title: str, dl_headers: dict, quality: str = ""):
+    """Runs entirely in a daemon thread — Flask is not involved.
+
+    `quality`, if given, is the target vertical resolution (e.g. "1080")
+    taken from whatever quality the player had selected at the moment the
+    download was started. We pick the rendition whose height is closest to
+    that. An empty/unparseable `quality` means "Auto" was selected in the
+    player, so we fall back to the previous behavior of grabbing the
+    highest-resolution rendition available.
+    """
     ts_path = mp4_path = None
     try:
         # resolve variant
@@ -646,10 +683,26 @@ def _run_download_job(job_id: str, url: str, title: str, dl_headers: dict):
         variants = re.findall(r'(#EXT-X-STREAM-INF:[^\n]+\n)([^\n]+\.m3u8[^\n]*)', pl_text)
         variant_url = url
         if variants:
-            def _h(v):
+            def _height(v):
                 m = re.search(r"RESOLUTION=(\d+)x(\d+)", v[0])
                 return int(m.group(2)) if m else 0
-            best = max(variants, key=_h)
+
+            target_height = None
+            if quality:
+                try:
+                    target_height = int(quality)
+                except ValueError:
+                    target_height = None
+
+            if target_height:
+                # Closest match to the resolution the player had selected,
+                # preferring an exact match when one exists.
+                best = min(variants, key=lambda v: abs(_height(v) - target_height))
+                debug(f"[job {job_id}] quality={target_height}p requested -> picked {_height(best)}p variant")
+            else:
+                best = max(variants, key=_height)
+                debug(f"[job {job_id}] quality=auto -> picked highest available ({_height(best)}p)")
+
             variant_url = _attach_token(url, urljoin(url, best[1].strip()))
             pl_bytes = fetch_bytes_retry(variant_url, headers=dl_headers)
             pl_text  = pl_bytes.decode("utf-8", errors="ignore")
@@ -724,8 +777,9 @@ def _run_download_job(job_id: str, url: str, title: str, dl_headers: dict):
 @app.route("/download_mp4")
 def download_mp4():
     """Start a background download job; return job_id immediately."""
-    url   = request.args.get("url")
-    title = request.args.get("title", "").strip()
+    url     = request.args.get("url")
+    title   = request.args.get("title", "").strip()
+    quality = request.args.get("quality", "").strip()  # target height in px, e.g. "1080"; "" = auto/highest
     if not url:
         return "Missing url param", 400
     if not shutil.which("ffmpeg"):
@@ -737,7 +791,7 @@ def download_mp4():
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending", "path": None, "title": title, "msg": None, "pct": 0}
 
-    t = threading.Thread(target=_run_download_job, args=(job_id, url, title, dl_headers), daemon=True)
+    t = threading.Thread(target=_run_download_job, args=(job_id, url, title, dl_headers, quality), daemon=True)
     t.start()
 
     return jsonify({"job_id": job_id})
@@ -1207,6 +1261,23 @@ button:active { transform: translateY(0); }
 }
 #downloadBtn { margin-top: 18px; }
 #downloadBtn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; box-shadow: none; transform: none; filter: none; }
+#downloadQuality {
+  -webkit-appearance: none; -moz-appearance: none; appearance: none;
+  display: inline-block;
+  flex: none;
+  margin-top: 18px; margin-left: 10px;
+  width: auto; min-width: 130px; max-width: 160px;
+  height: 44px; line-height: 20px;
+  padding: 0 14px;
+  font-size: 0.95rem;
+  text-align: center; text-align-last: center;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  font-family: inherit;
+  vertical-align: middle;
+}
 #downloads-panel {
   width: 80%; max-width: 900px; margin-top: 14px;
   display: flex; flex-direction: column; gap: 10px;
@@ -1239,16 +1310,28 @@ button:active { transform: translateY(0); }
 #video { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; }
 #loading {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  color: #fff; font-size: 1rem; font-weight: 500; background: rgba(10,10,12,0.75);
+  display: none; align-items: center; justify-content: center;
+  width: 64px; height: 64px; border-radius: 50%;
+  background: rgba(10,10,12,0.6);
   backdrop-filter: blur(6px);
-  padding: 14px 22px; border-radius: 10px; display: none;
   border: 1px solid var(--border);
 }
+.spinner {
+  width: 32px; height: 32px;
+  border: 3px solid rgba(255,255,255,0.2);
+  border-top-color: var(--cyan-bright);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 #debug-overlay {
-  position: absolute; top: 12px; left: 12px; color: var(--cyan-bright); font-size: 11px;
-  font-family: 'SFMono-Regular', Menlo, monospace; background-color: rgba(0,0,0,0.4); padding: 5px 10px;
-  border-radius: 6px; pointer-events: none; z-index: 100; white-space: pre-line;
-  backdrop-filter: blur(4px);
+  margin-top: 14px;
+  color: var(--cyan-bright);
+  font-size: 11px;
+  font-family: 'SFMono-Regular', Menlo, monospace;
+  text-align: center;
+  min-height: 14px;
+  white-space: pre-line;
 }
 #quality {
   position: absolute; top: 12px; right: 12px; z-index: 100;
@@ -1270,17 +1353,6 @@ button:active { transform: translateY(0); }
   transition: background 0.15s ease, transform 0.15s ease;
 }
 #nextEpisodeBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
-#airplayBtn {
-  position: absolute; bottom: 58px; left: 14px; z-index: 100;
-  background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
-  border-radius: 8px; width: 38px; height: 38px; cursor: pointer;
-  backdrop-filter: blur(6px);
-  display: none; align-items: center; justify-content: center;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-  transition: background 0.15s ease, transform 0.15s ease;
-}
-#airplayBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
-#airplayBtn svg { width: 19px; height: 19px; fill: #fff; }
 .autocomplete-dropdown {
   position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
   padding: 6px; margin: 0; border-radius: var(--radius-sm); z-index: 1000; display: none;
@@ -1318,11 +1390,11 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
     color: #14181a;
   }
   #loading {
-    font-size: 15px; padding: 10px 16px; border-radius: 10px; background: rgba(10,10,12,0.75);
-    color: #fff; display: none; text-align: center; max-width: 90%; box-sizing: border-box;
+    width: 52px; height: 52px; display: none;
   }
+  .spinner { width: 26px; height: 26px; border-width: 3px; }
   #nextEpisodeBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
-  #airplayBtn { bottom: 48px; left: 10px; width: 34px; height: 34px; }
+  #downloadQuality { margin-left: 8px; min-width: 110px; max-width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
 }
 </style>
 </head>
@@ -1339,14 +1411,16 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   <video id="video" controls crossorigin playsinline x-webkit-airplay="allow"></video>
   <select id="quality" style="display:none;"><option value="-1">Auto</option></select>
   <button id="nextEpisodeBtn">Next Episode &#9656;</button>
-  <button id="airplayBtn" title="AirPlay">
-    <svg viewBox="0 0 24 24"><path d="M6 22h12l-6-6z"/><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v-2H3V5h18v12h-4v2h4c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
-  </button>
-  <div id="loading">Loading video, please wait...</div>
-  <div id="debug-overlay"></div>
+  <div id="loading"><div class="spinner"></div></div>
 </div>
 <button id="downloadBtn">Download MP4</button>
+<select id="downloadQuality">
+  <option value="1080">High</option>
+  <option value="720" selected>Medium</option>
+  <option value="480">Low</option>
+</select>
 <div id="downloads-panel"></div>
+<div id="debug-overlay"></div>
 <footer>v2.0</footer>
 <script>
 const video        = document.getElementById('video');
@@ -1356,11 +1430,13 @@ const titleInput   = document.getElementById('title');
 const seasonSelect = document.getElementById('season');
 const episodeSelect= document.getElementById('episode');
 const qualitySelect= document.getElementById('quality');
+const downloadQualitySelect = document.getElementById('downloadQuality');
 const dropdown     = document.getElementById('autocomplete');
 const downloadBtn  = document.getElementById('downloadBtn');
 const nextEpisodeBtn = document.getElementById('nextEpisodeBtn');
-const airplayBtn = document.getElementById('airplayBtn');
 let hlsInstance    = null;
+let usingNativeHls = false; // true when this browser plays HLS natively (required for real AirPlay)
+let currentLevels  = null;  // hls.js levels array from the last MANIFEST_PARSED, used to resolve download quality
 let selectedTmdbId = null;
 let currentM3u8Url = null;
 let currentTitle   = null;
@@ -1409,8 +1485,18 @@ video.addEventListener('timeupdate', () => {
     maybeTriggerNextEpisodePrescrape();
 });
 
-function showLoading(show){ loading.style.display = show ? 'block' : 'none'; }
+function showLoading(show){ loading.style.display = show ? 'flex' : 'none'; }
 function updateDebug(msg){ debugOverlay.textContent = msg; }
+
+// Lets AirPlay (and the lock screen / Now Playing widget) show the actual
+// title of what's playing instead of just this page's title ("Flex
+// Stream"). Supported by Safari on macOS/iOS/iPadOS as well as Chrome.
+function updateMediaSessionMetadata(title){
+    if (!('mediaSession' in navigator)) return;
+    try{
+        navigator.mediaSession.metadata = new MediaMetadata({ title: title || 'Video' });
+    }catch(e){}
+}
 
 function levelLabel(level){
     if(level.height)   return level.height + 'p';
@@ -1438,20 +1524,24 @@ qualitySelect.addEventListener('change', () => {
     hlsInstance.currentLevel = parseInt(qualitySelect.value, 10);
 });
 
-// ── AirPlay ───────────────────────────────────────────────────────────────
-// This is the same route Safari's own native controls use to cast to an
-// Apple TV — no screen mirroring involved, the video plays directly on the
-// Apple TV while this page just remains a remote. It's a WebKit-only API
-// (Safari/iOS/iPadOS/macOS), so the button only appears on browsers that
-// actually expose it; other browsers never see it since they have no way
-// to fulfill it.
-if (window.WebKitPlaybackTargetAvailabilityEvent && typeof video.webkitShowPlaybackTargetPicker === 'function') {
-    video.addEventListener('webkitplaybacktargetavailabilitychanged', (event) => {
-        airplayBtn.style.display = (event.availability === 'available') ? 'flex' : 'none';
-    });
-    airplayBtn.addEventListener('click', () => {
-        try { video.webkitShowPlaybackTargetPicker(); } catch (e) { console.error('AirPlay picker error:', e); }
-    });
+// ── Download quality ────────────────────────────────────────────────────
+// Playback quality (above) auto-switches with the connection — that's
+// handled internally by hls.js's ABR when hls.js is driving playback, or
+// by the browser/OS itself (AVFoundation) when native HLS is used for
+// AirPlay-capable Safari. A download is a one-shot file rather than
+// adaptive playback, so it gets its own fixed Low/Medium/High selector
+// (always available, even before anything has loaded — Download triggers
+// its own load if needed). Each option is just a target resolution; the
+// server already picks whichever actual rendition in the stream's master
+// playlist is closest to that target, so this "rounds" to the nearest
+// quality the stream actually offers.
+
+// Resolves the Low/Medium/High choice into a target vertical resolution
+// (e.g. 720) to send to /download_mp4. The server matches this against the
+// stream's actual available renditions and picks whichever is closest —
+// so this always "rounds" to the nearest quality the stream really offers.
+function getSelectedDownloadQuality(){
+    return parseInt(downloadQualitySelect.value, 10);
 }
 
 const RECENT_KEY = 'flexstream_recent_searches';
@@ -1539,15 +1629,47 @@ function getStreamCache(){
 // Shared attach logic for both a freshly-resolved URL and a cached one.
 // onReady()/onFail() let callers (quick reattach vs. full resolve) react
 // differently to success/failure instead of duplicating the hls.js wiring.
+//
+// Native HLS (video.src = proxied url, decoded by the browser/OS itself) is
+// tried FIRST wherever the browser supports it (Safari on macOS/iOS/iPadOS
+// and tvOS). That's required for AirPlay to hand off *real remote
+// playback* — full duration/scrub bar/timestamps and audio — to an Apple
+// TV, instead of the "screen mirroring only" fallback you get when the
+// element is driven by hls.js/MediaSource. hls.js is only used as a
+// fallback on browsers with no native HLS support (Chrome, Firefox,
+// Android). Safari's own built-in video controls already expose an
+// AirPlay icon for the native path, so no extra button is needed here.
 function attachStream(m3u8, resumeAt, onReady, onFail){
     const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
     let readyFired=false;
-    if(Hls.isSupported()){
+    const nativeHlsSupported = video.canPlayType('application/vnd.apple.mpegurl');
+
+    if(nativeHlsSupported){
+        usingNativeHls = true;
+        currentLevels = null; // native playback has no manual per-level list to expose
+        if(hlsInstance){ hlsInstance.destroy(); hlsInstance = null; }
+        qualitySelect.style.display='none';
+        video.src=proxied;
+        video.addEventListener('loadedmetadata',function onMeta(){
+            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
+            video.play().catch(()=>{});
+            video.removeEventListener('loadedmetadata', onMeta);
+            readyFired=true;
+            updateDebug('Playing (native HLS, AirPlay-ready)');
+            if(onReady) onReady();
+        });
+        video.addEventListener('error', function onErr(){
+            video.removeEventListener('error', onErr);
+            if (!readyFired && onFail) onFail();
+        }, { once: true });
+    } else if(Hls.isSupported()){
+        usingNativeHls = false;
         if(hlsInstance) hlsInstance.destroy();
         hlsInstance=new Hls();
         hlsInstance.loadSource(proxied);
         hlsInstance.attachMedia(video);
         hlsInstance.on(Hls.Events.MANIFEST_PARSED,(event,data)=>{
+            currentLevels = data.levels;
             populateQualityLevels(data.levels);
             if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
             video.play().catch(()=>{});
@@ -1577,20 +1699,6 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
                     break;
             }
         });
-    } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-        qualitySelect.style.display='none';
-        video.src=proxied;
-        video.addEventListener('loadedmetadata',function onMeta(){
-            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
-            video.play().catch(()=>{});
-            video.removeEventListener('loadedmetadata', onMeta);
-            readyFired=true;
-            if(onReady) onReady();
-        });
-        video.addEventListener('error', function onErr(){
-            video.removeEventListener('error', onErr);
-            if (!readyFired && onFail) onFail();
-        }, { once: true });
     } else {
         updateDebug('HLS not supported in this browser');
         if (onFail) onFail(); else alert('HLS not supported in this browser');
@@ -1628,6 +1736,7 @@ function resolveAndPlay(resumeAt){
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
         saveStreamCache(m3u8, currentTitle, loadedQueryKey);
+        updateMediaSessionMetadata(currentTitle);
         attachStream(m3u8, resumeAt);
         return m3u8;
     }
@@ -1864,8 +1973,10 @@ function trackJob(jobId, title) {
     poll();
 }
 
-function startDownload(m3u8Url, title) {
-    fetch('/download_mp4?url=' + encodeURIComponent(m3u8Url) + '&title=' + encodeURIComponent(title))
+function startDownload(m3u8Url, title, quality) {
+    let url = '/download_mp4?url=' + encodeURIComponent(m3u8Url) + '&title=' + encodeURIComponent(title);
+    if (quality) url += '&quality=' + encodeURIComponent(quality);
+    fetch(url)
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (!data.job_id) { alert('Failed to start download'); return; }
@@ -1878,7 +1989,7 @@ function startDownload(m3u8Url, title) {
 downloadBtn.addEventListener('click', function(){
     const alreadyLoaded = currentM3u8Url && !isStreamBroken() && loadedQueryKey === currentQueryKey();
     if (alreadyLoaded) {
-        startDownload(currentM3u8Url, currentTitle || 'video');
+        startDownload(currentM3u8Url, currentTitle || 'video', getSelectedDownloadQuality());
         return;
     }
     const originalText = downloadBtn.textContent;
@@ -1888,7 +1999,7 @@ downloadBtn.addEventListener('click', function(){
         downloadBtn.disabled = false;
         downloadBtn.textContent = originalText;
         if(!m3u8) return; // resolveAndPlay already alerted on failure
-        startDownload(currentM3u8Url, currentTitle || 'video');
+        startDownload(currentM3u8Url, currentTitle || 'video', getSelectedDownloadQuality());
     });
 });
 
