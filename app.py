@@ -40,16 +40,28 @@ def get_headers() -> dict:
 _stream_origins = {}
 _stream_origins_lock = threading.Lock()
 
-def remember_stream_origin(m3u8_url: str, origin: str):
+def remember_stream_origin(url_for_host: str, origin: str):
+    """Associates the Origin/Referer to send with a CDN *host* (not the
+    exact URL) — variant playlists and segments share the master's host but
+    aren't the same URL, so keying by host lets /proxy_playlist and
+    /segment look up the right headers for any request belonging to that
+    stream. This also means a background prescrape of a different episode
+    (which briefly repoints the global "current" origin while it works)
+    can't corrupt headers for a host the live stream has already recorded.
+    """
+    host = urlparse(url_for_host).netloc
+    if not host or not origin:
+        return
     with _stream_origins_lock:
-        _stream_origins[m3u8_url] = origin
+        _stream_origins[host] = origin
         if len(_stream_origins) > 200:
             oldest_key = next(iter(_stream_origins))
             del _stream_origins[oldest_key]
 
-def get_headers_for_stream(m3u8_url: str) -> dict:
+def get_headers_for_stream(url: str) -> dict:
+    host = urlparse(url).netloc
     with _stream_origins_lock:
-        origin = _stream_origins.get(m3u8_url)
+        origin = _stream_origins.get(host)
     if not origin:
         origin = _current_origin["value"] or "https://cloudorchestranova.com"
     return {
@@ -504,7 +516,7 @@ def proxy_playlist():
         # A couple of quick retries absorbs the rare transient 5xx/524
         # (origin timeout) blip from the upstream CDN without ever
         # surfacing an error to the player.
-        pl_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.75)
+        pl_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.75, headers=get_headers_for_stream(url))
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
     pl_text = pl_bytes.decode('utf-8', errors='ignore')
@@ -527,7 +539,7 @@ def segment():
         return "Missing u param", 400
     url = unquote_plus(u)
     try:
-        remote_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.5)
+        remote_bytes = fetch_bytes_retry(url, max_retries=2, base_delay=0.5, headers=get_headers_for_stream(url))
         remote_bytes = extract_ts_packets(remote_bytes)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
@@ -933,6 +945,147 @@ def get_m3u8():
     return first_m3u8
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Episode prescraping
+#
+# While an episode is playing, once it's within its last few minutes we
+# kick off a background scrape of the *next* episode (rolling over into the
+# next season if the current one is finished) and cache the result. If the
+# person then loads that next episode, /get_prescraped serves the
+# already-captured m3u8 instantly instead of repeating the whole
+# search+scrape pipeline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_prescrape_cache: dict = {}   # key -> {"status": "pending"|"done"|"error", "m3u8": str|None, "ts": float}
+_prescrape_lock = threading.Lock()
+PRESCRAPE_TTL_SECONDS = 60 * 60  # captured links are typically valid for hours; keep for 1h to stay safely fresh
+
+
+def _prescrape_key(tmdb_id, season, episode) -> str:
+    return f"{tmdb_id}:{season}:{episode}"
+
+
+def _cleanup_stale_prescrapes():
+    while True:
+        time.sleep(120)
+        now = time.time()
+        with _prescrape_lock:
+            stale = [k for k, v in _prescrape_cache.items() if now - v.get("ts", now) > PRESCRAPE_TTL_SECONDS]
+            for k in stale:
+                del _prescrape_cache[k]
+
+
+threading.Thread(target=_cleanup_stale_prescrapes, daemon=True).start()
+
+
+def _next_episode_for(tmdb_id: int, season: int, episode: int):
+    """Returns (season, episode) of the next released episode after the
+    given one, rolling over into the next season (e.g. S2E10 -> S3E1) once
+    the current season is exhausted. Returns None if there's nothing next
+    yet (e.g. the show hasn't aired further episodes)."""
+    eps = get_released_episodes(tmdb_id, season)
+    later_in_season = sorted(e["episode_number"] for e in eps if e["episode_number"] > episode)
+    if later_in_season:
+        return season, later_in_season[0]
+    next_season_eps = get_released_episodes(tmdb_id, season + 1)
+    if next_season_eps:
+        return season + 1, min(e["episode_number"] for e in next_season_eps)
+    return None
+
+
+def _resolve_tv_episode_stream(tmdb_id: int, season: int, episode: int):
+    """Same resolution pipeline as /get_m3u8's TV branch, but starting from
+    an already-known tmdb_id instead of a title search — used for
+    prescraping the next episode in the background."""
+    external_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
+    external_resp = requests.get(external_url, timeout=REQUEST_TIMEOUT).json()
+    imdb_id = external_resp.get("imdb_id")
+    if not imdb_id:
+        return None
+    vsrc_embed = f"https://vsrc.su/embed/tv?imdb={imdb_id}&season={season}&episode={episode}&dts=dd"
+    iframe_src = get_player_iframe_src(vsrc_embed)
+    if not iframe_src:
+        return None
+    return capture_first_m3u8(iframe_src, retries=3)
+
+
+def _run_prescrape_job(key: str, tmdb_id: int, season: int, episode: int):
+    # Scraping repoints the shared "current origin" while it works (the
+    # same mechanism /get_m3u8 uses). Save/restore it around the job so a
+    # prescrape running alongside an actively-playing stream doesn't leave
+    # that global origin pointed at the wrong show any longer than the
+    # scrape itself takes — the per-host header cache (remember_stream_
+    # origin/get_headers_for_stream) is the real protection for the live
+    # stream's own proxy requests; this is just belt-and-suspenders.
+    saved_origin = _current_origin["value"]
+    try:
+        m3u8 = _resolve_tv_episode_stream(tmdb_id, season, episode)
+        if m3u8:
+            remember_stream_origin(m3u8, _current_origin["value"])
+        with _prescrape_lock:
+            _prescrape_cache[key] = {"status": "done" if m3u8 else "error", "m3u8": m3u8, "ts": time.time()}
+        debug(f"[prescrape {key}] {'captured ' + m3u8 if m3u8 else 'failed to capture'}")
+    except Exception as e:
+        debug(f"[prescrape {key}] error: {e}")
+        with _prescrape_lock:
+            _prescrape_cache[key] = {"status": "error", "m3u8": None, "ts": time.time()}
+    finally:
+        _current_origin["value"] = saved_origin
+
+
+@app.route("/prescrape_next")
+def prescrape_next():
+    """Idempotently kicks off a background scrape of the episode after the
+    given one (rolling into the next season if needed). Fire-and-forget —
+    the caller doesn't wait on this; it just polls /get_prescraped later."""
+    tmdb_id = request.args.get("tmdb_id")
+    season = request.args.get("season")
+    episode = request.args.get("episode")
+    if not tmdb_id or not season or not episode:
+        return jsonify({"status": "invalid"}), 400
+    try:
+        tmdb_id, season, episode = int(tmdb_id), int(season), int(episode)
+    except ValueError:
+        return jsonify({"status": "invalid"}), 400
+
+    nxt = _next_episode_for(tmdb_id, season, episode)
+    if not nxt:
+        return jsonify({"status": "none"})
+    next_season, next_episode = nxt
+    key = _prescrape_key(tmdb_id, next_season, next_episode)
+
+    with _prescrape_lock:
+        existing = _prescrape_cache.get(key)
+        if existing and existing["status"] in ("pending", "done"):
+            return jsonify({"status": existing["status"], "season": next_season, "episode": next_episode})
+        _prescrape_cache[key] = {"status": "pending", "m3u8": None, "ts": time.time()}
+
+    threading.Thread(target=_run_prescrape_job, args=(key, tmdb_id, next_season, next_episode), daemon=True).start()
+    debug(f"[prescrape {key}] started (S{next_season}E{next_episode})")
+    return jsonify({"status": "started", "season": next_season, "episode": next_episode})
+
+
+@app.route("/get_prescraped")
+def get_prescraped():
+    tmdb_id = request.args.get("tmdb_id")
+    season = request.args.get("season")
+    episode = request.args.get("episode")
+    if not tmdb_id or not season or not episode:
+        return jsonify({"status": "none"})
+    try:
+        tmdb_id, season, episode = int(tmdb_id), int(season), int(episode)
+    except ValueError:
+        return jsonify({"status": "none"})
+    key = _prescrape_key(tmdb_id, season, episode)
+    with _prescrape_lock:
+        entry = _prescrape_cache.get(key)
+    if not entry:
+        return jsonify({"status": "none"})
+    if entry["status"] == "done" and entry["m3u8"]:
+        return jsonify({"status": "done", "m3u8": entry["m3u8"]})
+    return jsonify({"status": entry["status"]})
+
+
 PLAYER_HTML = """<!doctype html>
 <html>
 <head>
@@ -1105,6 +1258,29 @@ button:active { transform: translateY(0); }
   transition: background-color 0.15s ease;
 }
 #quality:hover { background-color: rgba(10,10,12,0.9); }
+#nextEpisodeBtn {
+  /* Sits above the native <video> controls bar (which includes the
+     fullscreen button in its bottom-right corner) rather than on top of
+     it, so the two never overlap/compete for taps. */
+  position: absolute; bottom: 58px; right: 14px; z-index: 100;
+  background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px; padding: 9px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+  font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
+  display: none; align-items: center; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+#nextEpisodeBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#airplayBtn {
+  position: absolute; bottom: 58px; left: 14px; z-index: 100;
+  background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px; width: 38px; height: 38px; cursor: pointer;
+  backdrop-filter: blur(6px);
+  display: none; align-items: center; justify-content: center;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+#airplayBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#airplayBtn svg { width: 19px; height: 19px; fill: #fff; }
 .autocomplete-dropdown {
   position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
   padding: 6px; margin: 0; border-radius: var(--radius-sm); z-index: 1000; display: none;
@@ -1145,6 +1321,8 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
     font-size: 15px; padding: 10px 16px; border-radius: 10px; background: rgba(10,10,12,0.75);
     color: #fff; display: none; text-align: center; max-width: 90%; box-sizing: border-box;
   }
+  #nextEpisodeBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
+  #airplayBtn { bottom: 48px; left: 10px; width: 34px; height: 34px; }
 }
 </style>
 </head>
@@ -1158,8 +1336,12 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   <ul id="autocomplete" class="autocomplete-dropdown"></ul>
 </div>
 <div id="video-container">
-  <video id="video" controls crossorigin playsinline></video>
+  <video id="video" controls crossorigin playsinline x-webkit-airplay="allow"></video>
   <select id="quality" style="display:none;"><option value="-1">Auto</option></select>
+  <button id="nextEpisodeBtn">Next Episode &#9656;</button>
+  <button id="airplayBtn" title="AirPlay">
+    <svg viewBox="0 0 24 24"><path d="M6 22h12l-6-6z"/><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v-2H3V5h18v12h-4v2h4c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
+  </button>
   <div id="loading">Loading video, please wait...</div>
   <div id="debug-overlay"></div>
 </div>
@@ -1176,6 +1358,8 @@ const episodeSelect= document.getElementById('episode');
 const qualitySelect= document.getElementById('quality');
 const dropdown     = document.getElementById('autocomplete');
 const downloadBtn  = document.getElementById('downloadBtn');
+const nextEpisodeBtn = document.getElementById('nextEpisodeBtn');
+const airplayBtn = document.getElementById('airplayBtn');
 let hlsInstance    = null;
 let selectedTmdbId = null;
 let currentM3u8Url = null;
@@ -1183,13 +1367,47 @@ let currentTitle   = null;
 let lastKnownTime  = 0;
 let recoveryInProgress = false;
 let loadedQueryKey = null;
+let loadedTmdbId     = null;
+let loadedSeasonNum  = null;
+let loadedEpisodeNum = null;
+let prescrapeTriggeredForKey = null;
+let nextEpisodeTarget = null; // {season, episode} once known, shown via nextEpisodeBtn
 
 function currentQueryKey(){
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
     return [title.trim().toLowerCase(), year||'', seasonSelect.value||'', episodeSelect.value||''].join('|');
 }
 
-video.addEventListener('timeupdate', () => { lastKnownTime = video.currentTime; });
+// Once we're within the last 5 minutes of a TV episode — whether reached
+// by watching naturally or by seeking/skipping there — kick off a
+// background scrape of the next episode (rolling into the next season if
+// this one's finished), so advancing to it later can skip straight to
+// playback. Only fires once per loaded episode. The same prescrape lookup
+// tells us what the next episode actually is, so we reuse it to reveal the
+// "Next Episode" button once we know where it should take the viewer.
+const PRESCRAPE_WINDOW_SECONDS = 300;
+function maybeTriggerNextEpisodePrescrape(){
+    if (!loadedTmdbId || !loadedSeasonNum || !loadedEpisodeNum) return;
+    if (prescrapeTriggeredForKey === loadedQueryKey) return;
+    if (!isFinite(video.duration) || video.duration <= 0) return;
+    if (video.duration - video.currentTime > PRESCRAPE_WINDOW_SECONDS) return;
+    prescrapeTriggeredForKey = loadedQueryKey; // only ever try once per loaded episode
+    fetch('/prescrape_next?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(loadedSeasonNum)+'&episode='+encodeURIComponent(loadedEpisodeNum))
+        .then(r=>r.json())
+        .then(function(d){
+            if (d && d.season && d.episode) {
+                console.log('Preloading next episode: S'+d.season+'E'+d.episode);
+                nextEpisodeTarget = { season: d.season, episode: d.episode };
+                nextEpisodeBtn.style.display = 'flex';
+            }
+        })
+        .catch(()=>{});
+}
+
+video.addEventListener('timeupdate', () => {
+    lastKnownTime = video.currentTime;
+    maybeTriggerNextEpisodePrescrape();
+});
 
 function showLoading(show){ loading.style.display = show ? 'block' : 'none'; }
 function updateDebug(msg){ debugOverlay.textContent = msg; }
@@ -1219,6 +1437,22 @@ qualitySelect.addEventListener('change', () => {
     if(!hlsInstance) return;
     hlsInstance.currentLevel = parseInt(qualitySelect.value, 10);
 });
+
+// ── AirPlay ───────────────────────────────────────────────────────────────
+// This is the same route Safari's own native controls use to cast to an
+// Apple TV — no screen mirroring involved, the video plays directly on the
+// Apple TV while this page just remains a remote. It's a WebKit-only API
+// (Safari/iOS/iPadOS/macOS), so the button only appears on browsers that
+// actually expose it; other browsers never see it since they have no way
+// to fulfill it.
+if (window.WebKitPlaybackTargetAvailabilityEvent && typeof video.webkitShowPlaybackTargetPicker === 'function') {
+    video.addEventListener('webkitplaybacktargetavailabilitychanged', (event) => {
+        airplayBtn.style.display = (event.availability === 'available') ? 'flex' : 'none';
+    });
+    airplayBtn.addEventListener('click', () => {
+        try { video.webkitShowPlaybackTargetPicker(); } catch (e) { console.error('AirPlay picker error:', e); }
+    });
+}
 
 const RECENT_KEY = 'flexstream_recent_searches';
 function getRecent(){ try{ const r=localStorage.getItem(RECENT_KEY); const a=r?JSON.parse(r):[]; return Array.isArray(a)?a:[]; }catch(e){return[];} }
@@ -1308,7 +1542,32 @@ function getStreamCache(){
 function attachStream(m3u8, resumeAt, onReady, onFail){
     const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
     let readyFired=false;
-    if(Hls.isSupported()){
+    // Safari's native HLS engine is preferred over hls.js when available.
+    // hls.js works by feeding the video element through MediaSource
+    // Extensions (MSE); Safari's AirPlay can only mirror *audio* from an
+    // MSE-backed video (it can't hand the video track off to the Apple TV
+    // for genuine "video plays remotely, phone stays free" AirPlay). Only
+    // Safari's own native HLS pipeline supports full video+audio AirPlay,
+    // so on browsers that offer it we use it instead of hls.js. hls.js is
+    // still the right choice everywhere else (Chrome, Firefox, etc. have
+    // no native HLS support and no AirPlay to lose).
+    const nativeHlsSupport = video.canPlayType('application/vnd.apple.mpegurl');
+    if(nativeHlsSupport){
+        qualitySelect.style.display='none';
+        video.src=proxied;
+        video.addEventListener('loadedmetadata',function onMeta(){
+            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
+            video.play().catch(()=>{});
+            video.removeEventListener('loadedmetadata', onMeta);
+            readyFired=true;
+            if(onReady) onReady();
+        });
+        video.addEventListener('error', function onErr(){
+            video.removeEventListener('error', onErr);
+            if (!readyFired && onFail) onFail();
+            else reresolveAndResume();
+        }, { once: true });
+    } else if(Hls.isSupported()){
         if(hlsInstance) hlsInstance.destroy();
         hlsInstance=new Hls();
         hlsInstance.loadSource(proxied);
@@ -1343,20 +1602,6 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
                     break;
             }
         });
-    } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-        qualitySelect.style.display='none';
-        video.src=proxied;
-        video.addEventListener('loadedmetadata',function onMeta(){
-            if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
-            video.play().catch(()=>{});
-            video.removeEventListener('loadedmetadata', onMeta);
-            readyFired=true;
-            if(onReady) onReady();
-        });
-        video.addEventListener('error', function onErr(){
-            video.removeEventListener('error', onErr);
-            if (!readyFired && onFail) onFail();
-        }, { once: true });
     } else {
         updateDebug('HLS not supported in this browser');
         if (onFail) onFail(); else alert('HLS not supported in this browser');
@@ -1372,32 +1617,88 @@ function resolveAndPlay(resumeAt){
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
     if(!title){ alert('Enter a title'); return Promise.resolve(null); }
     const season=seasonSelect.value, episode=episodeSelect.value;
-    showLoading(true); updateDebug('Searching TMDb...'); qualitySelect.style.display='none';
-    let url='/get_m3u8?title='+encodeURIComponent(title);
-    if(year) url+='&year='+year;
-    if(season) url+='&season='+season;
-    if(episode) url+='&episode='+episode;
+    const queryKey=[title.trim().toLowerCase(), year||'', season||'', episode||''].join('|');
     currentM3u8Url=null;
     currentTitle=titleInput.value.trim()||title;
     if(season) currentTitle+=' S'+season;
     if(episode) currentTitle+='E'+episode;
-    return fetch(url).then(r=>r.text()).then(m3u8=>{
+    showLoading(true); updateDebug('Searching TMDb...'); qualitySelect.style.display='none';
+
+    function finish(m3u8){
         showLoading(false);
         if(!m3u8){ updateDebug('No video found'); alert('No video found'); return null; }
         updateDebug('Video URL captured. Loading HLS...');
         currentM3u8Url=m3u8;
-        loadedQueryKey=[title.trim().toLowerCase(), year||'', season||'', episode||''].join('|');
+        loadedQueryKey=queryKey;
+        loadedTmdbId=selectedTmdbId||null;
+        loadedSeasonNum=season?parseInt(season,10):null;
+        loadedEpisodeNum=episode?parseInt(episode,10):null;
+        prescrapeTriggeredForKey=null; // this episode hasn't triggered its own next-episode prescrape yet
+        nextEpisodeTarget=null;
+        nextEpisodeBtn.style.display='none';
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
         saveStreamCache(m3u8, currentTitle, loadedQueryKey);
         attachStream(m3u8, resumeAt);
         return m3u8;
-    }).catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
+    }
+
+    function fullScrape(){
+        let url='/get_m3u8?title='+encodeURIComponent(title);
+        if(year) url+='&year='+year;
+        if(season) url+='&season='+season;
+        if(episode) url+='&episode='+episode;
+        return fetch(url).then(r=>r.text()).then(finish)
+            .catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
+    }
+
+    // If this exact episode was already prescraped in the background while
+    // the previous one was finishing up, skip the search+scrape entirely
+    // and use that instantly.
+    if (selectedTmdbId && season && episode) {
+        const preUrl='/get_prescraped?tmdb_id='+encodeURIComponent(selectedTmdbId)+'&season='+encodeURIComponent(season)+'&episode='+encodeURIComponent(episode);
+        return fetch(preUrl).then(r=>r.json()).then(function(pre){
+            if (pre && pre.status==='done' && pre.m3u8) {
+                updateDebug('Using preloaded stream...');
+                return finish(pre.m3u8);
+            }
+            return fullScrape();
+        }).catch(fullScrape);
+    }
+    return fullScrape();
 }
 
 function load(){
     resolveAndPlay();
 }
+
+// ── Next Episode ─────────────────────────────────────────────────────────
+// Populates the season/episode dropdowns to match nextEpisodeTarget (set by
+// maybeTriggerNextEpisodePrescrape once the upcoming episode is known),
+// then loads it. Reuses /get_prescraped under the hood via resolveAndPlay,
+// so if the background prescrape already finished this jumps straight to
+// playback with no extra search/scrape wait.
+function goToNextEpisode(){
+    if (!nextEpisodeTarget || !selectedTmdbId) return;
+    const target = nextEpisodeTarget;
+    nextEpisodeBtn.disabled = true;
+    seasonSelect.value = target.season;
+    fetch('/episodes?tmdb_id='+selectedTmdbId+'&season_number='+target.season).then(r=>r.json()).then(eps=>{
+        episodeSelect.innerHTML='<option value="">Episode</option>';
+        const today=new Date();
+        eps.forEach(ep=>{
+            if(!ep.air_date||new Date(ep.air_date)>today) return;
+            const o=document.createElement('option'); o.value=ep.episode_number;
+            o.textContent=ep.episode_number+': '+ep.name; episodeSelect.appendChild(o);
+        });
+        episodeSelect.value = target.episode;
+        nextEpisodeBtn.style.display = 'none';
+        nextEpisodeBtn.disabled = false;
+        resolveAndPlay();
+    }).catch(()=>{ nextEpisodeBtn.disabled = false; });
+}
+
+nextEpisodeBtn.addEventListener('click', goToNextEpisode);
 
 // ── Auto-recovery ────────────────────────────────────────────────────────
 // If playback dies (a rare transient upstream hiccup) or the tab/phone was
