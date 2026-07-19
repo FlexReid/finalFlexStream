@@ -513,11 +513,15 @@ def proxy_playlist():
     if cached and now - cached['ts'] < CACHE_TTL:
         return Response(cached['data'], mimetype="application/vnd.apple.mpegurl")
     try:
-        # A few quick retries absorbs the rare transient 5xx/524 (origin
-        # timeout) blip from the upstream CDN, and also gives a
-        # freshly-issued token a little time to propagate/settle across the
-        # CDN's edge if it 403s immediately after being minted.
-        pl_bytes = fetch_bytes_retry(url, max_retries=3, base_delay=1.0, headers=get_headers_for_stream(url))
+        # A handful of retries with growing backoff absorbs both the rare
+        # transient 5xx/524 (origin timeout) blip from the upstream CDN,
+        # and — more importantly for THIS endpoint specifically, since it's
+        # the very first fetch of a freshly-minted manifest URL — gives a
+        # brand new token real time to propagate/settle across the CDN's
+        # edge network if it 403s immediately after being minted. This is
+        # a one-time cost per stream (not per-segment), so it's fine for it
+        # to take a bit longer than the segment endpoint's fast-fail retry.
+        pl_bytes = fetch_bytes_retry(url, max_retries=5, base_delay=1.2, headers=get_headers_for_stream(url))
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
     pl_text = pl_bytes.decode('utf-8', errors='ignore')
@@ -1645,12 +1649,24 @@ function parseTitleAndYear(f){ const m=f.match(/^(.*)\s+\((\d{4})\)$/); return m
 // (10-30s) when re-attaching also fails. Kept in localStorage (not just a
 // JS variable) so it also survives the tab being fully reloaded/killed
 // while backgrounded, not just briefly suspended.
+//
+// IMPORTANT: this must only ever be written once playback is *confirmed*
+// working (i.e. from attachStream's onReady callback) — never optimistically
+// right after a URL is resolved. A link can be resolved successfully but
+// still be dead on arrival (e.g. upstream 403s it), and if that URL were
+// cached here anyway, every later recovery path that reads this cache
+// (reresolveAndResume's quick-reattach fast path, in particular) would just
+// keep re-serving the exact same broken link on every subsequent failure —
+// which is exactly the "retrying does nothing" symptom this used to cause.
 const STREAM_CACHE_KEY = 'flexstream_last_stream';
 function saveStreamCache(m3u8, title, queryKey){
     try{ localStorage.setItem(STREAM_CACHE_KEY, JSON.stringify({ m3u8, title, queryKey, ts: Date.now() })); }catch(e){}
 }
 function getStreamCache(){
     try{ const r=localStorage.getItem(STREAM_CACHE_KEY); return r?JSON.parse(r):null; }catch(e){ return null; }
+}
+function clearStreamCache(){
+    try{ localStorage.removeItem(STREAM_CACHE_KEY); }catch(e){}
 }
 
 // Shared attach logic for both a freshly-resolved URL and a cached one.
@@ -1666,9 +1682,24 @@ function getStreamCache(){
 // fallback on browsers with no native HLS support (Chrome, Firefox,
 // Android). Safari's own built-in video controls already expose an
 // AirPlay icon for the native path, so no extra button is needed here.
+//
+// A load-timeout failsafe backs up the 'error' event: an upstream 403/502
+// on the very first manifest fetch doesn't always surface as a fired
+// 'error' event on <video> (some browsers just leave it stuck at
+// readyState 0 indefinitely instead), which used to show the "can't play"
+// icon while never actually calling onFail — so nothing ever recovered.
+// If loadedmetadata hasn't happened within LOAD_TIMEOUT_MS, treat it as a
+// failure exactly like a real 'error' event would.
+const LOAD_TIMEOUT_MS = 20000;
 function attachStream(m3u8, resumeAt, onReady, onFail){
     const proxied='/proxy_playlist?url='+encodeURIComponent(m3u8);
     let readyFired=false;
+    let failFired=false;
+    function fail(){
+        if (readyFired || failFired) return;
+        failFired = true;
+        if (onFail) onFail();
+    }
     const nativeHlsSupported = video.canPlayType('application/vnd.apple.mpegurl');
 
     if(nativeHlsSupported){
@@ -1677,7 +1708,9 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
         if(hlsInstance){ hlsInstance.destroy(); hlsInstance = null; }
         qualitySelect.style.display='none';
         video.src=proxied;
+        const loadTimeoutId = setTimeout(fail, LOAD_TIMEOUT_MS);
         video.addEventListener('loadedmetadata',function onMeta(){
+            clearTimeout(loadTimeoutId);
             if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
             video.play().catch(()=>{});
             video.removeEventListener('loadedmetadata', onMeta);
@@ -1687,15 +1720,18 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
         });
         video.addEventListener('error', function onErr(){
             video.removeEventListener('error', onErr);
-            if (!readyFired && onFail) onFail();
+            clearTimeout(loadTimeoutId);
+            fail();
         }, { once: true });
     } else if(Hls.isSupported()){
         usingNativeHls = false;
         if(hlsInstance) hlsInstance.destroy();
         hlsInstance=new Hls();
+        const loadTimeoutId = setTimeout(fail, LOAD_TIMEOUT_MS);
         hlsInstance.loadSource(proxied);
         hlsInstance.attachMedia(video);
         hlsInstance.on(Hls.Events.MANIFEST_PARSED,(event,data)=>{
+            clearTimeout(loadTimeoutId);
             currentLevels = data.levels;
             populateQualityLevels(data.levels);
             if(resumeAt && resumeAt>1) video.currentTime=resumeAt;
@@ -1721,14 +1757,15 @@ function attachStream(m3u8, resumeAt, onReady, onFail){
                     break;
                 default:
                     // Not internally recoverable by hls.js itself.
-                    if (!readyFired && onFail) onFail();
+                    clearTimeout(loadTimeoutId);
+                    if (!readyFired) fail();
                     else reresolveAndResume();
                     break;
             }
         });
     } else {
         updateDebug('HLS not supported in this browser');
-        if (onFail) onFail(); else alert('HLS not supported in this browser');
+        fail();
     }
 }
 
@@ -1757,6 +1794,13 @@ function resolveAndPlay(resumeAt){
             .catch(err=>{ showLoading(false); updateDebug('Error: '+err); alert('Failed to load video'); return null; });
     }
 
+    // Up to two automatic fresh-scrape retries if a resolved link turns out
+    // to be dead on arrival (e.g. upstream 403). A single captured link
+    // occasionally comes from a bad mirror/edge and a re-scrape gets a
+    // working one; this happens silently (spinner keeps showing) rather
+    // than surfacing a failure to the person unless *every* attempt fails.
+    let attemptsLeft = 2;
+
     function finish(m3u8, fromCache){
         showLoading(false);
         if(!m3u8){ updateDebug('No video found'); alert('No video found'); return null; }
@@ -1771,34 +1815,37 @@ function resolveAndPlay(resumeAt){
         nextEpisodeBtn.style.display='none';
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
-        saveStreamCache(m3u8, currentTitle, loadedQueryKey);
         updateMediaSessionMetadata(currentTitle);
 
-        // If playback never actually starts (attachStream's onFail), don't
-        // just leave a dead player sitting there. A cached/prescraped link
-        // in particular can be stale (e.g. the upstream 403'd it) — reusing
-        // the exact same link on a manual retry would reproduce the
-        // identical failure instantly, which is confusing. So: drop that
-        // specific cache entry and get a genuinely fresh scrape once,
-        // automatically, instead of making the person notice and retry.
-        let retriedFresh = false;
         showLoading(true);
         attachStream(m3u8, resumeAt, function onReady(){
             showLoading(false);
+            // Only now — playback has actually started — is it safe to
+            // remember this link for future quick-reattach recovery.
+            saveStreamCache(m3u8, currentTitle, loadedQueryKey);
         }, function onFail(){
-            if (fromCache && !retriedFresh) {
-                retriedFresh = true;
-                if (loadedTmdbId && season && episode) {
-                    fetch('/invalidate_prescraped?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(season)+'&episode='+encodeURIComponent(episode)).catch(()=>{});
-                }
-                updateDebug('Preloaded stream failed, fetching a fresh one...');
+            // This exact link never played. Make sure nothing downstream
+            // (this tab's recovery paths, or a future load of the same
+            // episode) can reuse it: invalidate the server-side prescrape
+            // entry for it if it came from one, and clear the client-side
+            // stream cache too in case a previous *different* episode's
+            // entry is somehow still pointing at it.
+            if (loadedTmdbId && season && episode) {
+                fetch('/invalidate_prescraped?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(season)+'&episode='+encodeURIComponent(episode)).catch(()=>{});
+            }
+            const cached = getStreamCache();
+            if (cached && cached.m3u8 === m3u8) clearStreamCache();
+
+            if (attemptsLeft > 0) {
+                attemptsLeft--;
+                updateDebug('Stream link failed, fetching a fresh one...');
                 showLoading(true);
                 fullScrape();
                 return;
             }
             showLoading(false);
             updateDebug('Playback failed to start');
-            alert('Playback failed to start. Please try Load & Play again.');
+            alert('Playback failed to start after a few tries. The source may be temporarily unavailable — please try again in a bit.');
         });
         return m3u8;
     }
@@ -1856,7 +1903,10 @@ nextEpisodeBtn.addEventListener('click', goToNextEpisode);
 // connection can just drop), this quietly recovers instead of showing a
 // dead player. It tries the fast path first — just re-attach to the same
 // cached m3u8 URL — and only pays for a full TMDb search + re-scrape if
-// that fails too (e.g. the link genuinely expired).
+// that fails too (e.g. the link genuinely expired). Because the stream
+// cache is now only ever populated after confirmed-successful playback
+// (see saveStreamCache's call site above), that fast path can never
+// re-serve a link that's already known to be dead.
 function isStreamBroken(){
     if (!currentM3u8Url) return false;
     if (video.error) return true;
@@ -1888,6 +1938,8 @@ function reresolveAndResume(){
         }, function onFail(){
             if (settled) return;
             settled = true;
+            const c = getStreamCache();
+            if (c && c.m3u8 === cachedUrl) clearStreamCache();
             fullResolve();
         });
     } else {
