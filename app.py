@@ -439,6 +439,99 @@ def fetch_bytes(url):
     r.raise_for_status()
     return r.content
 
+def _request_header_variants(url: str):
+    """A few different request 'shapes' to try in turn against a CDN URL.
+    Some CDNs soft-block a request that doesn't look the way they expect —
+    not with a 403/429 (which fetch_bytes_retry's status-code retry logic
+    already handles) but with a plain 200 and an empty body, which looks
+    identical to "successfully fetched nothing" from the HTTP layer alone.
+    Since we can't tell in advance which header shape a given CDN wants,
+    try progressively different ones rather than giving up after the first
+    empty response — this is cheap since each attempt only costs one quick
+    request, and it's exactly the "try it a different way" fallback that
+    matters when the plain, direct fetch keeps coming back empty despite
+    the URL clearly having real content behind it.
+    """
+    base = get_headers_for_stream(url)
+    ua = base.get("User-Agent", "Mozilla/5.0")
+
+    # 1) Exactly what every other request in this proxy uses: spoofed
+    #    Origin/Referer pointed at the site that issued the stream.
+    variant_normal = dict(base)
+
+    # 2) No Origin/Referer at all. If the CDN is actually doing a strict
+    #    Referer/Origin allowlist check and silently zeroing the body on a
+    #    mismatch (rather than rejecting outright), a bare request with
+    #    neither header can succeed where a wrong-looking one wouldn't.
+    variant_bare = {"User-Agent": ua}
+
+    # 3) A fuller "real browser" header set layered on top of the normal
+    #    Origin/Referer, in case what's tripping it up is generic bot
+    #    fingerprinting (missing Accept/Accept-Language/Sec-Fetch-* etc.)
+    #    rather than anything about Origin/Referer specifically.
+    variant_browserish = dict(base)
+    variant_browserish.update({
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+    })
+
+    return [variant_normal, variant_bare, variant_browserish]
+
+
+def fetch_bytes_with_fallback(url: str, max_retries_per_variant: int = 1, base_delay: float = 0.3) -> bytes:
+    """Like fetch_bytes_retry, but if a request "succeeds" (2xx) with a
+    suspiciously empty body, tries again with a different header shape
+    (see _request_header_variants) before giving up. A plain empty body
+    isn't distinguishable from a real error by status code alone, so this
+    inspects the payload itself and only accepts a result once it actually
+    has content."""
+    last_exc = None
+    for headers in _request_header_variants(url):
+        try:
+            data = fetch_bytes_retry(url, max_retries=max_retries_per_variant, base_delay=base_delay, headers=headers)
+        except Exception as e:
+            last_exc = e
+            continue
+        if data:
+            return data
+        debug(f"[fetch_bytes_with_fallback] Empty body from {url} using headers={list(headers.keys())} — trying next fallback")
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"All header strategies returned an empty body for {url}")
+
+
+def fetch_playlist_bytes_with_fallback(url: str, max_retries_per_variant: int = 5, base_delay: float = 1.2) -> bytes:
+    """Same idea as fetch_bytes_with_fallback, but for the playlist
+    endpoint specifically: a response can come back non-empty and still be
+    unusable (a CDN error page, a captcha wall, etc. instead of real M3U8
+    text), so this checks for the actual '#EXTM3U' signature rather than
+    just "did we get any bytes at all" before accepting a result."""
+    last_exc = None
+    last_bad = None
+    for headers in _request_header_variants(url):
+        try:
+            data = fetch_bytes_retry(url, max_retries=max_retries_per_variant, base_delay=base_delay, headers=headers)
+        except Exception as e:
+            last_exc = e
+            continue
+        if data and data.lstrip().startswith(b'#EXTM3U'):
+            return data
+        last_bad = data
+        debug(f"[fetch_playlist_bytes_with_fallback] Non-playlist response from {url} using headers={list(headers.keys())} — trying next fallback")
+    if last_exc:
+        raise last_exc
+    # Every variant returned *something* but none of it was a valid
+    # playlist — return the last attempt's bytes (even if empty) so the
+    # caller's own "isn't a real playlist" handling can produce the
+    # right error message instead of masking it as a network failure.
+    return last_bad or b''
+
+
 def fetch_bytes_retry(url, max_retries=6, base_delay=1.5, headers=None):
     last_exc = None
     for attempt in range(max_retries + 1):
@@ -521,7 +614,10 @@ def proxy_playlist():
         # edge network if it 403s immediately after being minted. This is
         # a one-time cost per stream (not per-segment), so it's fine for it
         # to take a bit longer than the segment endpoint's fast-fail retry.
-        pl_bytes = fetch_bytes_retry(url, max_retries=5, base_delay=1.2, headers=get_headers_for_stream(url))
+        # fetch_bytes_with_fallback additionally tries alternate request
+        # header shapes if a response comes back empty, in case that's the
+        # CDN quietly soft-blocking rather than a real transient failure.
+        pl_bytes = fetch_playlist_bytes_with_fallback(url, max_retries_per_variant=5, base_delay=1.2)
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
     pl_text = pl_bytes.decode('utf-8', errors='ignore')
@@ -544,15 +640,34 @@ def segment():
         return "Missing u param", 400
     url = unquote_plus(u)
     try:
-        # Fail fast here (short single retry) rather than a slow backoff —
-        # native players (AVPlayer etc.) already retry a failed segment
-        # fetch on their own shortly after, so it's better for us to
-        # respond quickly and let the player's own retry catch it than to
-        # add several more seconds of server-side backoff on top.
-        remote_bytes = fetch_bytes_retry(url, max_retries=1, base_delay=0.3, headers=get_headers_for_stream(url))
-        remote_bytes = extract_ts_packets(remote_bytes)
+        # Fail fast per attempt (short single retry) rather than a slow
+        # backoff — native players (AVPlayer etc.) already retry a failed
+        # segment fetch on their own shortly after, so it's better for us
+        # to respond quickly and let the player's own retry catch it than
+        # to add several more seconds of server-side backoff on top.
+        # fetch_bytes_with_fallback additionally tries a couple of
+        # different request header shapes if the first attempt "succeeds"
+        # with an empty body — the actual issue behind the 416s seen
+        # earlier, where the plain fetch was quietly coming back with zero
+        # bytes despite the URL clearly having real content.
+        remote_bytes = fetch_bytes_with_fallback(url, max_retries_per_variant=1, base_delay=0.3)
     except Exception as e:
         return f"Failed to fetch remote segment: {e}", 502
+
+    # extract_ts_packets only recognizes classic 188-byte-aligned MPEG-TS
+    # (looking for 0x47 sync bytes at regular intervals). Some sources
+    # serve segments that don't fit that shape (e.g. fMP4/CMAF chunks, or
+    # TS that just isn't packet-aligned the way it expects) — in that case
+    # it finds nothing and returns empty, which used to silently discard a
+    # segment that actually had perfectly valid content (confirmed by the
+    # fact that fetching the raw URL directly plays fine). Rather than lose
+    # real data, fall back to the untouched fetched bytes whenever
+    # extraction comes back empty despite the fetch itself succeeding.
+    extracted = extract_ts_packets(remote_bytes)
+    if extracted:
+        remote_bytes = extracted
+    elif remote_bytes:
+        debug(f"[segment] extract_ts_packets found no TS sync pattern in {len(remote_bytes)} bytes from {url} — passing raw bytes through instead of discarding them")
 
     total_len = len(remote_bytes)
 
@@ -571,8 +686,22 @@ def segment():
             end = int(end_str) if end_str else total_len - 1
             end = min(end, total_len - 1)
             if total_len == 0 or start > end or start >= total_len:
-                resp = Response(status=416)
-                resp.headers['Content-Range'] = f'bytes */{total_len}'
+                # The requested range can't be satisfied — almost always
+                # because the underlying fetch above came back empty (a
+                # transient upstream failure the single fast retry didn't
+                # catch), not because the player asked for something
+                # unreasonable. A real 416 here is fatal: native players
+                # (AVPlayer in particular) don't gracefully retry after a
+                # 416 the way they do after a 502/404 — they just freeze
+                # instead of advancing to the next segment. Falling back to
+                # a plain 200 with whatever content we actually have (which
+                # the player will simply re-request with Range again on its
+                # own if it still comes up short) keeps playback moving
+                # instead of wedging it.
+                debug(f"[segment] Range {range_header} unsatisfiable against {total_len} bytes for {url} — falling back to full content instead of 416")
+                resp = Response(remote_bytes, mimetype="video/MP2T")
+                resp.headers['Content-Length'] = str(total_len)
+                resp.headers['Accept-Ranges'] = 'bytes'
                 return resp
             chunk = remote_bytes[start:end + 1]
             resp = Response(chunk, status=206, mimetype="video/MP2T")
