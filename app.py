@@ -1425,10 +1425,10 @@ button:active { transform: translateY(0); }
   -webkit-appearance: none; -moz-appearance: none; appearance: none;
   display: inline-block;
   flex: none;
-  margin-top: 18px; margin-left: 10px;
+  margin-top: 18px; margin-left: 0px;
   width: auto; min-width: 130px; max-width: 160px;
   height: 44px; line-height: 20px;
-  padding: 0 14px;
+  padding: 0 0px;
   font-size: 0.95rem;
   text-align: center; text-align-last: center;
   border-radius: var(--radius-sm);
@@ -1494,7 +1494,7 @@ button:active { transform: translateY(0); }
   white-space: pre-line;
 }
 #quality {
-  position: absolute; top: 12px; right: 12px; z-index: 100;
+  position: absolute; top: 12px; right: 0px; z-index: 100;
   background-color: rgba(10,10,12,0.7); color: #fff; border: 1px solid rgba(255,255,255,0.15);
   border-radius: 8px; padding: 7px 12px; font-size: 0.82rem; max-width: 110px; cursor: pointer;
   font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
@@ -1554,7 +1554,7 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   }
   .spinner { width: 26px; height: 26px; border-width: 3px; }
   #nextEpisodeBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
-  #downloadQuality { margin-left: 8px; min-width: 110px; max-width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
+  #downloadQuality { margin-left: 0px; min-width: 110px; max-width: 130px; height: 40px; line-height: 18px; padding: 0 0px; font-size: 0.85rem; }
 }
 </style>
 </head>
