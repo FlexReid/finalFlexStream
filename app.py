@@ -1213,12 +1213,12 @@ def get_tv_imdb_id(tmdb_id: int):
 
 @app.route("/get_intro")
 def get_intro():
-    """Looks up intro/recap start-end windows for a TV episode from
+    """Looks up intro/recap/outro start-end windows for a TV episode from
     api.introdb.app's /segments endpoint, so the player can show a Skip
-    button during either one. Resolves imdb_id from the already-known
+    button during either intro/recap, and reveal the Next Episode button
+    once the outro actually starts. Resolves imdb_id from the already-known
     tmdb_id (same lookup /get_m3u8 does internally) rather than requiring
-    the client to know or pass it directly. Outro data is deliberately
-    ignored — not needed here."""
+    the client to know or pass it directly."""
     tmdb_id = request.args.get("tmdb_id")
     season = request.args.get("season")
     episode = request.args.get("episode")
@@ -1273,9 +1273,9 @@ def get_intro():
 
     intro = _parse_segment(data.get("intro")) if isinstance(data, dict) else None
     recap = _parse_segment(data.get("recap")) if isinstance(data, dict) else None
-    # outro intentionally dropped — not used by the player.
+    outro = _parse_segment(data.get("outro")) if isinstance(data, dict) else None
 
-    if not intro and not recap:
+    if not intro and not recap and not outro:
         return jsonify({"status": "none"})
 
     result = {"status": "done"}
@@ -1283,6 +1283,8 @@ def get_intro():
         result["intro"] = intro
     if recap:
         result["recap"] = recap
+    if outro:
+        result["outro"] = outro
     return jsonify(result)
 
 
@@ -1729,26 +1731,43 @@ let loadedEpisodeNum = null;
 let prescrapeTriggeredForKey = null;
 let nextEpisodeTarget = null; // {season, episode} once known, shown via nextEpisodeBtn
 let introWindow = null; // {intro: {start,end}|null, recap: {start,end}|null} once known
+let outroWindow = null; // {start,end}|null once known (null = no outro data for this episode)
 let introLookupKey = null; // guards against a slow /get_intro response from a previous episode landing late
+let introLookupDone = false; // true once the /get_intro fetch for the current episode has settled (success, "none", or error) — tells us whether outroWindow's null means "no outro" vs. "not resolved yet"
 
 function currentQueryKey(){
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
     return [title.trim().toLowerCase(), year||'', seasonSelect.value||'', episodeSelect.value||''].join('|');
 }
 
-// Once we're within the last 5 minutes of a TV episode — whether reached
-// by watching naturally or by seeking/skipping there — kick off a
-// background scrape of the next episode (rolling into the next season if
-// this one's finished), so advancing to it later can skip straight to
-// playback. Only fires once per loaded episode. The same prescrape lookup
-// tells us what the next episode actually is, so we reuse it to reveal the
-// "Next Episode" button once we know where it should take the viewer.
-const PRESCRAPE_WINDOW_SECONDS = 300;
+// ── Next Episode prescrape + button reveal ──────────────────────────────
+// The background prescrape of the next episode and the moment the "Next
+// Episode" button actually becomes visible are deliberately decoupled:
+// the prescrape should start a bit early so the link is ready by the time
+// it's needed, but the button itself should only appear once the outro is
+// actually underway (so it doesn't show up over regular episode content).
+//
+// When outro timing is known for this episode (from /get_intro):
+//   - prescrape starts PRESCRAPE_LEAD_BEFORE_OUTRO_SECONDS before the outro begins
+//   - the button appears once the outro actually starts
+// When no outro data is available for this episode:
+//   - prescrape starts PRESCRAPE_LEAD_NO_OUTRO_SECONDS before the end
+//   - the button appears NEXT_BTN_LEAD_NO_OUTRO_SECONDS before the end
+const PRESCRAPE_LEAD_BEFORE_OUTRO_SECONDS = 120; // 2 minutes before the outro begins
+const PRESCRAPE_LEAD_NO_OUTRO_SECONDS = 240;     // 4 minutes before the end, when there's no outro data
+const NEXT_BTN_LEAD_NO_OUTRO_SECONDS = 120;      // 2 minutes before the end, when there's no outro data
+
 function maybeTriggerNextEpisodePrescrape(){
     if (!loadedTmdbId || !loadedSeasonNum || !loadedEpisodeNum) return;
     if (prescrapeTriggeredForKey === loadedQueryKey) return;
+    if (!introLookupDone) return; // wait until we know whether this episode has outro data
     if (!isFinite(video.duration) || video.duration <= 0) return;
-    if (video.duration - video.currentTime > PRESCRAPE_WINDOW_SECONDS) return;
+
+    const triggerAt = outroWindow
+        ? outroWindow.start - PRESCRAPE_LEAD_BEFORE_OUTRO_SECONDS
+        : video.duration - PRESCRAPE_LEAD_NO_OUTRO_SECONDS;
+    if (video.currentTime < triggerAt) return;
+
     prescrapeTriggeredForKey = loadedQueryKey; // only ever try once per loaded episode
     fetch('/prescrape_next?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(loadedSeasonNum)+'&episode='+encodeURIComponent(loadedEpisodeNum))
         .then(r=>r.json())
@@ -1756,10 +1775,27 @@ function maybeTriggerNextEpisodePrescrape(){
             if (d && d.season && d.episode) {
                 console.log('Preloading next episode: S'+d.season+'E'+d.episode);
                 nextEpisodeTarget = { season: d.season, episode: d.episode };
-                nextEpisodeBtn.style.display = 'flex';
+                // Button visibility is handled separately by
+                // updateNextEpisodeButtonVisibility — it's gated on the
+                // outro actually starting (or the near-end fallback),
+                // not on the prescrape merely having been kicked off.
             }
         })
         .catch(()=>{});
+}
+
+function updateNextEpisodeButtonVisibility(){
+    if (!nextEpisodeTarget) { nextEpisodeBtn.style.display = 'none'; return; }
+    let showAt;
+    if (outroWindow) {
+        showAt = outroWindow.start;
+    } else if (isFinite(video.duration) && video.duration > 0) {
+        showAt = video.duration - NEXT_BTN_LEAD_NO_OUTRO_SECONDS;
+    } else {
+        nextEpisodeBtn.style.display = 'none';
+        return;
+    }
+    nextEpisodeBtn.style.display = (video.currentTime >= showAt) ? 'flex' : 'none';
 }
 
 // ── Skip Intro / Skip Recap ─────────────────────────────────────────────
@@ -1772,12 +1808,20 @@ function maybeTriggerNextEpisodePrescrape(){
 let activeSkipSegment = null; // {type: 'intro'|'recap', end} for whichever window currentTime is inside right now
 
 function maybeLookupIntro(){
-    if (!loadedTmdbId || !loadedSeasonNum || !loadedEpisodeNum) return; // movies have no season/episode
-    const key = loadedQueryKey;
-    introLookupKey = key;
     introWindow = null;
+    outroWindow = null;
+    introLookupDone = false;
     activeSkipSegment = null;
     skipIntroBtn.style.display = 'none';
+    if (!loadedTmdbId || !loadedSeasonNum || !loadedEpisodeNum) {
+        // Movies have no season/episode segment data — treat as
+        // "resolved, nothing found" so the next-episode logic (which
+        // doesn't apply to movies anyway) isn't left waiting forever.
+        introLookupDone = true;
+        return;
+    }
+    const key = loadedQueryKey;
+    introLookupKey = key;
     fetch('/get_intro?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(loadedSeasonNum)+'&episode='+encodeURIComponent(loadedEpisodeNum))
         .then(r=>r.json())
         .then(function(d){
@@ -1785,13 +1829,18 @@ function maybeLookupIntro(){
             // re-resolved) while this request was in flight, its result no
             // longer applies — drop it rather than showing stale windows.
             if (introLookupKey !== key) return;
+            introLookupDone = true;
             if (!d || d.status !== 'done') return;
             introWindow = {
                 intro: (d.intro && typeof d.intro.start === 'number' && typeof d.intro.end === 'number') ? d.intro : null,
                 recap: (d.recap && typeof d.recap.start === 'number' && typeof d.recap.end === 'number') ? d.recap : null,
             };
+            outroWindow = (d.outro && typeof d.outro.start === 'number' && typeof d.outro.end === 'number') ? d.outro : null;
         })
-        .catch(()=>{});
+        .catch(function(){
+            if (introLookupKey !== key) return;
+            introLookupDone = true; // failed lookup falls back to the no-outro-data behavior
+        });
 }
 
 function updateSkipIntroVisibility(){
@@ -1825,6 +1874,7 @@ skipIntroBtn.addEventListener('click', function(){
 video.addEventListener('timeupdate', () => {
     lastKnownTime = video.currentTime;
     maybeTriggerNextEpisodePrescrape();
+    updateNextEpisodeButtonVisibility();
     updateSkipIntroVisibility();
 });
 
@@ -1840,6 +1890,48 @@ function updateMediaSessionMetadata(title){
         navigator.mediaSession.metadata = new MediaMetadata({ title: title || 'Video' });
     }catch(e){}
 }
+
+// ── Fullscreen exit shouldn't pause playback ────────────────────────────
+// Some browsers/OSes (notably iOS Safari's native fullscreen video player,
+// and some Android WebViews) pause the video the instant fullscreen is
+// exited, even though nothing here asked for that. Track whether playback
+// was actually in progress right before fullscreen closes, and resume it
+// afterward if the browser paused it out from under us. Both the standard
+// Fullscreen API events and Safari's video-element-specific
+// webkitbeginfullscreen/webkitendfullscreen events are covered, since iOS
+// Safari's native <video> fullscreen doesn't fire the standard ones.
+let wasPlayingBeforeFullscreenExit = false;
+
+function handleFullscreenExit(){
+    // A small delay lets the browser's own pause (if any) actually land
+    // first, so we're resuming after it rather than racing it.
+    setTimeout(function(){
+        if (wasPlayingBeforeFullscreenExit && video.paused) {
+            video.play().catch(()=>{});
+        }
+    }, 50);
+}
+
+document.addEventListener('fullscreenchange', function(){
+    if (document.fullscreenElement) {
+        wasPlayingBeforeFullscreenExit = !video.paused;
+    } else {
+        handleFullscreenExit();
+    }
+});
+document.addEventListener('webkitfullscreenchange', function(){
+    if (document.webkitFullscreenElement) {
+        wasPlayingBeforeFullscreenExit = !video.paused;
+    } else {
+        handleFullscreenExit();
+    }
+});
+video.addEventListener('webkitbeginfullscreen', function(){
+    wasPlayingBeforeFullscreenExit = !video.paused;
+});
+video.addEventListener('webkitendfullscreen', function(){
+    handleFullscreenExit();
+});
 
 function levelLabel(level){
     if(level.height)   return level.height + 'p';
@@ -2126,6 +2218,8 @@ function resolveAndPlay(resumeAt){
         nextEpisodeTarget=null;
         nextEpisodeBtn.style.display='none';
         introWindow=null;
+        outroWindow=null;
+        introLookupDone=false;
         introLookupKey=null;
         skipIntroBtn.style.display='none';
         downloadBtn.disabled=false;
