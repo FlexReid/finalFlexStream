@@ -1186,6 +1186,106 @@ def _next_episode_for(tmdb_id: int, season: int, episode: int):
     return None
 
 
+_imdb_id_cache: dict = {}   # tmdb_id (tv) -> imdb_id, avoids re-hitting TMDb's external_ids endpoint every time
+_imdb_id_cache_lock = threading.Lock()
+
+
+def get_tv_imdb_id(tmdb_id: int):
+    """Resolves a TMDb TV show ID to its IMDb ID, cached in-memory since
+    it's the same lookup /get_m3u8 and the prescraper already do per show —
+    the intro-skip lookup below needs the same imdb_id again and there's no
+    reason to hit TMDb a second time for something that never changes."""
+    with _imdb_id_cache_lock:
+        cached = _imdb_id_cache.get(tmdb_id)
+    if cached:
+        return cached
+    external_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
+    try:
+        imdb_id = requests.get(external_url, timeout=REQUEST_TIMEOUT).json().get("imdb_id")
+    except Exception as e:
+        debug(f"[get_tv_imdb_id] Failed to resolve imdb_id for tmdb_id={tmdb_id}: {e}")
+        return None
+    if imdb_id:
+        with _imdb_id_cache_lock:
+            _imdb_id_cache[tmdb_id] = imdb_id
+    return imdb_id
+
+
+@app.route("/get_intro")
+def get_intro():
+    """Looks up intro/recap start-end windows for a TV episode from
+    api.introdb.app's /segments endpoint, so the player can show a Skip
+    button during either one. Resolves imdb_id from the already-known
+    tmdb_id (same lookup /get_m3u8 does internally) rather than requiring
+    the client to know or pass it directly. Outro data is deliberately
+    ignored — not needed here."""
+    tmdb_id = request.args.get("tmdb_id")
+    season = request.args.get("season")
+    episode = request.args.get("episode")
+    if not tmdb_id or not season or not episode:
+        return jsonify({"status": "invalid"}), 400
+    try:
+        tmdb_id, season, episode = int(tmdb_id), int(season), int(episode)
+    except ValueError:
+        return jsonify({"status": "invalid"}), 400
+
+    imdb_id = get_tv_imdb_id(tmdb_id)
+    if not imdb_id:
+        return jsonify({"status": "none"})
+
+    try:
+        r = requests.get(
+            "https://api.introdb.app/segments",
+            params={"imdb_id": imdb_id, "season": season, "episode": episode},
+            timeout=8,
+        )
+        if r.status_code == 404:
+            # No segment data for this episode — not an error, just
+            # nothing to show a Skip button for.
+            return jsonify({"status": "none"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        debug(f"[get_intro] Lookup failed for imdb_id={imdb_id} S{season}E{episode}: {e}")
+        return jsonify({"status": "error", "msg": str(e)})
+
+    def _parse_segment(seg):
+        """{"start_ms","end_ms","start_sec","end_sec",...} -> {"start","end"}
+        in seconds, preferring the *_sec fields and falling back to *_ms/1000
+        if those are missing. None if the segment is absent or malformed."""
+        if not isinstance(seg, dict):
+            return None
+        start = seg.get("start_sec")
+        end = seg.get("end_sec")
+        if start is None or end is None:
+            start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
+            if start_ms is not None and end_ms is not None:
+                start, end = start_ms / 1000.0, end_ms / 1000.0
+        if start is None or end is None:
+            return None
+        try:
+            start, end = float(start), float(end)
+        except (TypeError, ValueError):
+            return None
+        if end <= start:
+            return None
+        return {"start": start, "end": end}
+
+    intro = _parse_segment(data.get("intro")) if isinstance(data, dict) else None
+    recap = _parse_segment(data.get("recap")) if isinstance(data, dict) else None
+    # outro intentionally dropped — not used by the player.
+
+    if not intro and not recap:
+        return jsonify({"status": "none"})
+
+    result = {"status": "done"}
+    if intro:
+        result["intro"] = intro
+    if recap:
+        result["recap"] = recap
+    return jsonify(result)
+
+
 def _resolve_tv_episode_stream(tmdb_id: int, season: int, episode: int):
     """Same resolution pipeline as /get_m3u8's TV branch, but starting from
     an already-known tmdb_id instead of a title search — used for
@@ -1423,12 +1523,17 @@ button:active { transform: translateY(0); }
 #downloadBtn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; box-shadow: none; transform: none; filter: none; }
 #downloadQuality {
   -webkit-appearance: none; -moz-appearance: none; appearance: none;
-  display: inline-block;
-  flex: none;
-  margin-top: 18px; margin-left: 0px;
-  width: auto; min-width: 130px; max-width: 160px;
+  display: block;
+  /* auto left/right margins center this regardless of its own width —
+     more robust than relying solely on the parent's flex alignment, and
+     avoids the asymmetric-margin bug that was pushing it off-center
+     before (a lone margin-left shifts a centered flex item's visible
+     content away from true center). */
+  flex: 0 0 auto;
+  margin: 18px auto 0;
+  width: 150px;
   height: 44px; line-height: 20px;
-  padding: 0 0px;
+  padding: 0 14px;
   font-size: 0.95rem;
   text-align: center; text-align-last: center;
   border-radius: var(--radius-sm);
@@ -1436,7 +1541,6 @@ button:active { transform: translateY(0); }
   background: var(--bg-elevated-2);
   color: var(--text);
   font-family: inherit;
-  vertical-align: middle;
 }
 #downloads-panel {
   width: 80%; max-width: 900px; margin-top: 14px;
@@ -1494,7 +1598,7 @@ button:active { transform: translateY(0); }
   white-space: pre-line;
 }
 #quality {
-  position: absolute; top: 12px; right: 0px; z-index: 100;
+  position: absolute; top: 12px; right: 12px; z-index: 100;
   background-color: rgba(10,10,12,0.7); color: #fff; border: 1px solid rgba(255,255,255,0.15);
   border-radius: 8px; padding: 7px 12px; font-size: 0.82rem; max-width: 110px; cursor: pointer;
   font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
@@ -1513,6 +1617,19 @@ button:active { transform: translateY(0); }
   transition: background 0.15s ease, transform 0.15s ease;
 }
 #nextEpisodeBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#skipIntroBtn {
+  /* Same slot as #nextEpisodeBtn (above the native controls bar, clear of
+     the fullscreen button) — the two never need to show at the same time,
+     since the intro window is near the start of an episode and the next-
+     episode prompt only appears near the end. */
+  position: absolute; bottom: 58px; right: 14px; z-index: 100;
+  background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px; padding: 9px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+  font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
+  display: none; align-items: center; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+#skipIntroBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
 .autocomplete-dropdown {
   position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
   padding: 6px; margin: 0; border-radius: var(--radius-sm); z-index: 1000; display: none;
@@ -1554,7 +1671,8 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   }
   .spinner { width: 26px; height: 26px; border-width: 3px; }
   #nextEpisodeBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
-  #downloadQuality { margin-left: 0px; min-width: 110px; max-width: 130px; height: 40px; line-height: 18px; padding: 0 0px; font-size: 0.85rem; }
+  #skipIntroBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
+  #downloadQuality { margin: 12px auto 0; width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
 }
 </style>
 </head>
@@ -1571,6 +1689,7 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   <video id="video" controls crossorigin playsinline x-webkit-airplay="allow"></video>
   <select id="quality" style="display:none;"><option value="-1">Auto</option></select>
   <button id="nextEpisodeBtn">Next Episode &#9656;</button>
+  <button id="skipIntroBtn">Skip Intro &#9656;</button>
   <div id="loading"><div class="spinner"></div></div>
 </div>
 <button id="downloadBtn">Download MP4</button>
@@ -1594,6 +1713,7 @@ const downloadQualitySelect = document.getElementById('downloadQuality');
 const dropdown     = document.getElementById('autocomplete');
 const downloadBtn  = document.getElementById('downloadBtn');
 const nextEpisodeBtn = document.getElementById('nextEpisodeBtn');
+const skipIntroBtn = document.getElementById('skipIntroBtn');
 let hlsInstance    = null;
 let usingNativeHls = false; // true when this browser plays HLS natively (required for real AirPlay)
 let currentLevels  = null;  // hls.js levels array from the last MANIFEST_PARSED, used to resolve download quality
@@ -1608,6 +1728,8 @@ let loadedSeasonNum  = null;
 let loadedEpisodeNum = null;
 let prescrapeTriggeredForKey = null;
 let nextEpisodeTarget = null; // {season, episode} once known, shown via nextEpisodeBtn
+let introWindow = null; // {intro: {start,end}|null, recap: {start,end}|null} once known
+let introLookupKey = null; // guards against a slow /get_intro response from a previous episode landing late
 
 function currentQueryKey(){
     const {title,year}=parseTitleAndYear(titleInput.value.trim());
@@ -1640,9 +1762,70 @@ function maybeTriggerNextEpisodePrescrape(){
         .catch(()=>{});
 }
 
+// ── Skip Intro / Skip Recap ─────────────────────────────────────────────
+// Looked up once per episode from /get_intro (a thin wrapper around
+// api.introdb.app's /segments endpoint), then shown/hidden purely based on
+// current playback position — no separate polling needed once we have the
+// windows. Reuses the same slot/style as #nextEpisodeBtn (see the CSS)
+// since none of the three ever need to be visible at once: recap and
+// intro are near the start, next-episode only near the end.
+let activeSkipSegment = null; // {type: 'intro'|'recap', end} for whichever window currentTime is inside right now
+
+function maybeLookupIntro(){
+    if (!loadedTmdbId || !loadedSeasonNum || !loadedEpisodeNum) return; // movies have no season/episode
+    const key = loadedQueryKey;
+    introLookupKey = key;
+    introWindow = null;
+    activeSkipSegment = null;
+    skipIntroBtn.style.display = 'none';
+    fetch('/get_intro?tmdb_id='+encodeURIComponent(loadedTmdbId)+'&season='+encodeURIComponent(loadedSeasonNum)+'&episode='+encodeURIComponent(loadedEpisodeNum))
+        .then(r=>r.json())
+        .then(function(d){
+            // If a different episode has since loaded (or this one was
+            // re-resolved) while this request was in flight, its result no
+            // longer applies — drop it rather than showing stale windows.
+            if (introLookupKey !== key) return;
+            if (!d || d.status !== 'done') return;
+            introWindow = {
+                intro: (d.intro && typeof d.intro.start === 'number' && typeof d.intro.end === 'number') ? d.intro : null,
+                recap: (d.recap && typeof d.recap.start === 'number' && typeof d.recap.end === 'number') ? d.recap : null,
+            };
+        })
+        .catch(()=>{});
+}
+
+function updateSkipIntroVisibility(){
+    if (!introWindow) return;
+    const t = video.currentTime;
+    // Recap typically plays before the intro/opening titles, but check
+    // both regardless of order — whichever window currentTime actually
+    // falls inside wins.
+    let match = null;
+    if (introWindow.recap && t >= introWindow.recap.start && t < introWindow.recap.end) {
+        match = { type: 'recap', end: introWindow.recap.end };
+    } else if (introWindow.intro && t >= introWindow.intro.start && t < introWindow.intro.end) {
+        match = { type: 'intro', end: introWindow.intro.end };
+    }
+    activeSkipSegment = match;
+    if (match) {
+        skipIntroBtn.textContent = (match.type === 'recap' ? 'Skip Recap' : 'Skip Intro') + ' \u25B8';
+        skipIntroBtn.style.display = 'flex';
+    } else {
+        skipIntroBtn.style.display = 'none';
+    }
+}
+
+skipIntroBtn.addEventListener('click', function(){
+    if (!activeSkipSegment) return;
+    video.currentTime = activeSkipSegment.end;
+    activeSkipSegment = null;
+    skipIntroBtn.style.display = 'none';
+});
+
 video.addEventListener('timeupdate', () => {
     lastKnownTime = video.currentTime;
     maybeTriggerNextEpisodePrescrape();
+    updateSkipIntroVisibility();
 });
 
 function showLoading(show){ loading.style.display = show ? 'flex' : 'none'; }
@@ -1942,6 +2125,9 @@ function resolveAndPlay(resumeAt){
         prescrapeTriggeredForKey=null; // this episode hasn't triggered its own next-episode prescrape yet
         nextEpisodeTarget=null;
         nextEpisodeBtn.style.display='none';
+        introWindow=null;
+        introLookupKey=null;
+        skipIntroBtn.style.display='none';
         downloadBtn.disabled=false;
         addRecent(titleInput.value.trim()||title);
         updateMediaSessionMetadata(currentTitle);
@@ -1952,6 +2138,7 @@ function resolveAndPlay(resumeAt){
             // Only now — playback has actually started — is it safe to
             // remember this link for future quick-reattach recovery.
             saveStreamCache(m3u8, currentTitle, loadedQueryKey);
+            maybeLookupIntro();
         }, function onFail(){
             // This exact link never played. Make sure nothing downstream
             // (this tab's recovery paths, or a future load of the same
