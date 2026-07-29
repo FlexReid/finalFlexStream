@@ -1521,6 +1521,14 @@ button:active { transform: translateY(0); }
   box-shadow: 0 12px 40px rgba(0,0,0,0.5);
   border: 1px solid var(--border);
 }
+/* In real fullscreen the container's own rounded corners/border become
+   visible as an odd curved gap against the fullscreen black canvas, since
+   the browser just enlarges this element as-is rather than trimming it —
+   strip them while fullscreen so the video reads as a clean rectangle. */
+#video-container:fullscreen,
+#video-container:-webkit-full-screen {
+  border-radius: 0; border: none; box-shadow: none;
+}
 #downloadBtn { margin-top: 18px; }
 #downloadBtn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; box-shadow: none; transform: none; filter: none; }
 #downloadQuality {
@@ -1607,31 +1615,36 @@ button:active { transform: translateY(0); }
   transition: background-color 0.15s ease;
 }
 #quality:hover { background-color: rgba(10,10,12,0.9); }
-#nextEpisodeBtn {
-  /* Sits above the native <video> controls bar (which includes the
-     fullscreen button in its bottom-right corner) rather than on top of
-     it, so the two never overlap/compete for taps. */
+#bottomRightControls {
+  /* Sits above the native <video> controls bar (which includes its own
+     fullscreen icon in the bottom-right corner) rather than on top of it,
+     so nothing here overlaps/competes for taps with it. A flex row lets
+     the fullscreen button coexist alongside whichever of Next Episode /
+     Skip Intro happens to be showing, instead of them fighting over the
+     exact same spot. */
   position: absolute; bottom: 58px; right: 14px; z-index: 100;
+  display: flex; align-items: center; gap: 8px;
+}
+#nextEpisodeBtn, #skipIntroBtn, #customFullscreenBtn {
   background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
   border-radius: 8px; padding: 9px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
   font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
   display: none; align-items: center; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-  transition: background 0.15s ease, transform 0.15s ease;
+  transition: background 0.15s ease, transform 0.15s ease, opacity 0.25s ease;
 }
-#nextEpisodeBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
-#skipIntroBtn {
-  /* Same slot as #nextEpisodeBtn (above the native controls bar, clear of
-     the fullscreen button) — the two never need to show at the same time,
-     since the intro window is near the start of an episode and the next-
-     episode prompt only appears near the end. */
-  position: absolute; bottom: 58px; right: 14px; z-index: 100;
-  background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
-  border-radius: 8px; padding: 9px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
-  font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
-  display: none; align-items: center; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-  transition: background 0.15s ease, transform 0.15s ease;
+#nextEpisodeBtn:hover, #skipIntroBtn:hover, #customFullscreenBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#customFullscreenBtn {
+  /* Desktop only — mirrors how the native player's own controls (play,
+     seek, volume) fade out while just watching and only reappear on
+     mouse activity or while paused; this button follows the same rhythm
+     rather than sitting there permanently. */
+  padding: 9px 12px; font-size: 1rem; line-height: 1;
+  opacity: 0; pointer-events: none;
 }
-#skipIntroBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#customFullscreenBtn.controls-visible { opacity: 1; pointer-events: auto; }
+@media (max-width: 768px) {
+  #customFullscreenBtn { display: none !important; }
+}
 .autocomplete-dropdown {
   position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
   padding: 6px; margin: 0; border-radius: var(--radius-sm); z-index: 1000; display: none;
@@ -1672,8 +1685,8 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
     width: 52px; height: 52px; display: none;
   }
   .spinner { width: 26px; height: 26px; border-width: 3px; }
-  #nextEpisodeBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
-  #skipIntroBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
+  #bottomRightControls { bottom: 48px; right: 10px; }
+  #nextEpisodeBtn, #skipIntroBtn { padding: 8px 12px; font-size: 0.78rem; }
   #downloadQuality { margin: 12px auto 0; width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
 }
 /* Phone in landscape: keyed off height rather than width, since a rotated
@@ -1701,8 +1714,11 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
 <div id="video-container">
   <video id="video" controls crossorigin playsinline x-webkit-airplay="allow"></video>
   <select id="quality" style="display:none;"><option value="-1">Auto</option></select>
-  <button id="nextEpisodeBtn">Next Episode &#9656;</button>
-  <button id="skipIntroBtn">Skip Intro &#9656;</button>
+  <div id="bottomRightControls">
+    <button id="customFullscreenBtn" title="Fullscreen">&#9974;</button>
+    <button id="nextEpisodeBtn">Next Episode &#9656;</button>
+    <button id="skipIntroBtn">Skip Intro &#9656;</button>
+  </div>
   <div id="loading"><div class="spinner"></div></div>
 </div>
 <button id="downloadBtn">Download MP4</button>
@@ -1727,6 +1743,8 @@ const dropdown     = document.getElementById('autocomplete');
 const downloadBtn  = document.getElementById('downloadBtn');
 const nextEpisodeBtn = document.getElementById('nextEpisodeBtn');
 const skipIntroBtn = document.getElementById('skipIntroBtn');
+const videoContainer = document.getElementById('video-container');
+const customFullscreenBtn = document.getElementById('customFullscreenBtn');
 let hlsInstance    = null;
 let usingNativeHls = false; // true when this browser plays HLS natively (required for real AirPlay)
 let currentLevels  = null;  // hls.js levels array from the last MANIFEST_PARSED, used to resolve download quality
@@ -1902,6 +1920,56 @@ function updateMediaSessionMetadata(title){
     }catch(e){}
 }
 
+// ── Custom fullscreen button (desktop only) ─────────────────────────────
+// Hidden entirely on mobile via CSS (see #customFullscreenBtn's media
+// query) — this is purely a desktop convenience since mobile has its own
+// native fullscreen affordances. Fullscreens #video-container itself
+// (not the <video> element), so everything else in the container —
+// including the Next Episode / Skip Intro buttons — renders normally on
+// top of it instead of being left behind by a video-only fullscreen.
+function isInFullscreen(){
+    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function updateFullscreenButtonIcon(){
+    customFullscreenBtn.innerHTML = isInFullscreen() ? '&#10005;' : '&#9974;';
+    customFullscreenBtn.title = isInFullscreen() ? 'Exit fullscreen' : 'Fullscreen';
+}
+function toggleFullscreen(){
+    if (isInFullscreen()) {
+        if (document.exitFullscreen) document.exitFullscreen().catch(()=>{});
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } else if (videoContainer.requestFullscreen) {
+        videoContainer.requestFullscreen().catch(()=>{});
+    } else if (videoContainer.webkitRequestFullscreen) {
+        videoContainer.webkitRequestFullscreen();
+    }
+}
+customFullscreenBtn.addEventListener('click', toggleFullscreen);
+document.addEventListener('fullscreenchange', updateFullscreenButtonIcon);
+document.addEventListener('webkitfullscreenchange', updateFullscreenButtonIcon);
+
+// Fades the button in/out in step with the native player's own controls
+// (play/seek/volume): visible on mouse activity or while paused, hidden
+// again after a few seconds of inactivity during playback. No JS access
+// to the browser's actual native-controls visibility state exists, so
+// this mirrors it with the same well-known idle-timeout pattern instead.
+let controlsIdleTimer = null;
+function showFloatingFullscreenButton(){
+    customFullscreenBtn.classList.add('controls-visible');
+    if (controlsIdleTimer) { clearTimeout(controlsIdleTimer); controlsIdleTimer = null; }
+    if (!video.paused) {
+        controlsIdleTimer = setTimeout(function(){
+            customFullscreenBtn.classList.remove('controls-visible');
+        }, 3000);
+    }
+}
+videoContainer.addEventListener('mousemove', showFloatingFullscreenButton);
+videoContainer.addEventListener('mouseenter', showFloatingFullscreenButton);
+videoContainer.addEventListener('click', showFloatingFullscreenButton);
+video.addEventListener('play', showFloatingFullscreenButton);
+video.addEventListener('pause', showFloatingFullscreenButton);
+showFloatingFullscreenButton(); // visible by default until playback actually starts
+
 // ── Fullscreen exit shouldn't pause playback ────────────────────────────
 // Some browsers/OSes
 // (iOS Safari's native fullscreen video player in particular) pause the
@@ -1961,6 +2029,50 @@ document.addEventListener('webkitfullscreenchange', function(){
 });
 video.addEventListener('webkitbeginfullscreen', noteFullscreenEntered);
 video.addEventListener('webkitendfullscreen', noteFullscreenExited);
+
+// ── Mobile: "+10s" skip button during intro/outro ───────────────────────
+// iOS's native fullscreen player shows its own built-in "skip 10 seconds"
+// button that this page has no direct hook into — there's no discrete
+// event for "the +10s button was tapped", only the resulting seek. So
+// this watches for a seek that lands ~10 seconds ahead of where playback
+// just was, and if that jump started from inside the intro/recap or
+// outro window, treats it as "skip the whole thing" instead of a plain
+// +10s: jumping straight to the end of the intro/recap, or loading the
+// next episode if it was the outro. A manual scrub-bar drag landing by
+// coincidence within ~1.5s of a 10-second jump would also trigger this;
+// an accepted tradeoff since there's no way to tell the two apart.
+const IS_MOBILE_DEVICE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const TEN_SECOND_SKIP_MIN = 8.5;
+const TEN_SECOND_SKIP_MAX = 11.5;
+let suppressSeekHeuristic = false;
+
+if (IS_MOBILE_DEVICE) {
+    video.addEventListener('seeking', function(){
+        if (suppressSeekHeuristic) { suppressSeekHeuristic = false; return; }
+        const from = lastKnownTime;
+        const to = video.currentTime;
+        const delta = to - from;
+        if (delta < TEN_SECOND_SKIP_MIN || delta > TEN_SECOND_SKIP_MAX) return;
+
+        if (introWindow) {
+            const recap = introWindow.recap;
+            const intro = introWindow.intro;
+            if (recap && from >= recap.start && from < recap.end) {
+                suppressSeekHeuristic = true;
+                video.currentTime = recap.end;
+                return;
+            }
+            if (intro && from >= intro.start && from < intro.end) {
+                suppressSeekHeuristic = true;
+                video.currentTime = intro.end;
+                return;
+            }
+        }
+        if (outroWindow && from >= outroWindow.start && from < outroWindow.end && nextEpisodeTarget) {
+            goToNextEpisode();
+        }
+    });
+}
 
 function levelLabel(level){
     if(level.height)   return level.height + 'p';
