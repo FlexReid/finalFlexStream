@@ -1676,6 +1676,17 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   #skipIntroBtn { bottom: 48px; right: 10px; padding: 8px 12px; font-size: 0.78rem; }
   #downloadQuality { margin: 12px auto 0; width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
 }
+/* Phone in landscape: keyed off height rather than width, since a rotated
+   phone's width often exceeds the 768px breakpoint above (so that block
+   alone wouldn't catch it) — a short viewport height is what actually
+   signals "phone turned sideways" regardless of how wide it is. There's
+   much more room to work with here than in portrait, so let the video
+   claim most of the screen instead of staying pinned to the same ~35vh. */
+@media (orientation: landscape) and (max-height: 600px) {
+  #video-container video {
+    height: 90vh; max-height: 95vh;
+  }
+}
 </style>
 </head>
 <body>
