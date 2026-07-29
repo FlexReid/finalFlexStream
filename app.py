@@ -1527,7 +1527,18 @@ button:active { transform: translateY(0); }
    strip them while fullscreen so the video reads as a clean rectangle. */
 #video-container:fullscreen,
 #video-container:-webkit-full-screen {
+  /* The container's own max-width: 900px (set below) otherwise survives
+     into fullscreen unchanged — width alone doesn't override it — leaving
+     the "fullscreen" view stuck at 900px wide instead of actually filling
+     the screen. Reset it here, and center the (now letterboxed) video
+     within the full-viewport black box. */
   border-radius: 0; border: none; box-shadow: none;
+  width: 100vw; height: 100vh; max-width: none;
+  display: flex; align-items: center; justify-content: center;
+}
+#video-container:fullscreen video,
+#video-container:-webkit-full-screen video {
+  width: 100%; height: 100%; aspect-ratio: unset; object-fit: contain;
 }
 #downloadBtn { margin-top: 18px; }
 #downloadBtn:disabled { background: #3a3a3f; color: #74747c; cursor: not-allowed; box-shadow: none; transform: none; filter: none; }
@@ -1637,7 +1648,12 @@ button:active { transform: translateY(0); }
   /* Desktop only — mirrors how the native player's own controls (play,
      seek, volume) fade out while just watching and only reappear on
      mouse activity or while paused; this button follows the same rhythm
-     rather than sitting there permanently. */
+     rather than sitting there permanently. Needs its own `display: flex`
+     here because the shared rule above defaults to `display: none` (for
+     Next Episode / Skip Intro, which get toggled to flex via JS) — without
+     this override the button stays display:none forever and the opacity/
+     pointer-events toggling below never gets a chance to show it. */
+  display: flex;
   padding: 9px 12px; font-size: 1rem; line-height: 1;
   opacity: 0; pointer-events: none;
 }
@@ -1969,66 +1985,6 @@ videoContainer.addEventListener('click', showFloatingFullscreenButton);
 video.addEventListener('play', showFloatingFullscreenButton);
 video.addEventListener('pause', showFloatingFullscreenButton);
 showFloatingFullscreenButton(); // visible by default until playback actually starts
-
-// ── Fullscreen exit shouldn't pause playback ────────────────────────────
-// Some browsers/OSes
-// (iOS Safari's native fullscreen video player in particular) pause the
-// video the instant fullscreen is exited, even though nothing here asked
-// for that. Track whether playback was actually in progress right before
-// fullscreen closes, then fight to keep it playing afterward:
-//   - a 'pause' listener catches the exact moment iOS pauses it and
-//     immediately resumes, rather than guessing when to check, and
-//   - a short burst of retries (covering exit events that fire slightly
-//     out of order, or a pause that lands a beat later) backs that up.
-// Both the standard Fullscreen API events and Safari's video-element-
-// specific webkitbeginfullscreen/webkitendfullscreen events are covered,
-// since iOS Safari's native <video> fullscreen doesn't fire the standard
-// ones.
-let wasPlayingBeforeFullscreenExit = false;
-let fullscreenExitTimestamp = 0;
-const FULLSCREEN_EXIT_RESUME_WINDOW_MS = 1500; // treat a pause shortly after exit as the OS's own doing, not the user's
-
-function noteFullscreenEntered(){
-    wasPlayingBeforeFullscreenExit = !video.paused;
-}
-
-function noteFullscreenExited(){
-    fullscreenExitTimestamp = Date.now();
-    if (!wasPlayingBeforeFullscreenExit) return;
-    let attempts = 0;
-    const maxAttempts = 8;
-    const intervalId = setInterval(function(){
-        attempts++;
-        if (video.paused) {
-            video.play().catch(()=>{});
-        }
-        if (attempts >= maxAttempts) clearInterval(intervalId);
-    }, 150);
-}
-
-video.addEventListener('pause', function(){
-    if (!wasPlayingBeforeFullscreenExit) return;
-    if (Date.now() - fullscreenExitTimestamp < FULLSCREEN_EXIT_RESUME_WINDOW_MS) {
-        video.play().catch(()=>{});
-    }
-});
-
-document.addEventListener('fullscreenchange', function(){
-    if (document.fullscreenElement) {
-        noteFullscreenEntered();
-    } else {
-        noteFullscreenExited();
-    }
-});
-document.addEventListener('webkitfullscreenchange', function(){
-    if (document.webkitFullscreenElement) {
-        noteFullscreenEntered();
-    } else {
-        noteFullscreenExited();
-    }
-});
-video.addEventListener('webkitbeginfullscreen', noteFullscreenEntered);
-video.addEventListener('webkitendfullscreen', noteFullscreenExited);
 
 // ── Mobile: "+10s" skip button during intro/outro ───────────────────────
 // iOS's native fullscreen player shows its own built-in "skip 10 seconds"
