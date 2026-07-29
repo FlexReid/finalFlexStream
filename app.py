@@ -1892,46 +1892,64 @@ function updateMediaSessionMetadata(title){
 }
 
 // ── Fullscreen exit shouldn't pause playback ────────────────────────────
-// Some browsers/OSes (notably iOS Safari's native fullscreen video player,
-// and some Android WebViews) pause the video the instant fullscreen is
-// exited, even though nothing here asked for that. Track whether playback
-// was actually in progress right before fullscreen closes, and resume it
-// afterward if the browser paused it out from under us. Both the standard
-// Fullscreen API events and Safari's video-element-specific
-// webkitbeginfullscreen/webkitendfullscreen events are covered, since iOS
-// Safari's native <video> fullscreen doesn't fire the standard ones.
+// Some browsers/OSes
+// (iOS Safari's native fullscreen video player in particular) pause the
+// video the instant fullscreen is exited, even though nothing here asked
+// for that. Track whether playback was actually in progress right before
+// fullscreen closes, then fight to keep it playing afterward:
+//   - a 'pause' listener catches the exact moment iOS pauses it and
+//     immediately resumes, rather than guessing when to check, and
+//   - a short burst of retries (covering exit events that fire slightly
+//     out of order, or a pause that lands a beat later) backs that up.
+// Both the standard Fullscreen API events and Safari's video-element-
+// specific webkitbeginfullscreen/webkitendfullscreen events are covered,
+// since iOS Safari's native <video> fullscreen doesn't fire the standard
+// ones.
 let wasPlayingBeforeFullscreenExit = false;
+let fullscreenExitTimestamp = 0;
+const FULLSCREEN_EXIT_RESUME_WINDOW_MS = 1500; // treat a pause shortly after exit as the OS's own doing, not the user's
 
-function handleFullscreenExit(){
-    // A small delay lets the browser's own pause (if any) actually land
-    // first, so we're resuming after it rather than racing it.
-    setTimeout(function(){
-        if (wasPlayingBeforeFullscreenExit && video.paused) {
+function noteFullscreenEntered(){
+    wasPlayingBeforeFullscreenExit = !video.paused;
+}
+
+function noteFullscreenExited(){
+    fullscreenExitTimestamp = Date.now();
+    if (!wasPlayingBeforeFullscreenExit) return;
+    let attempts = 0;
+    const maxAttempts = 8;
+    const intervalId = setInterval(function(){
+        attempts++;
+        if (video.paused) {
             video.play().catch(()=>{});
         }
-    }, 50);
+        if (attempts >= maxAttempts) clearInterval(intervalId);
+    }, 150);
 }
+
+video.addEventListener('pause', function(){
+    if (!wasPlayingBeforeFullscreenExit) return;
+    if (Date.now() - fullscreenExitTimestamp < FULLSCREEN_EXIT_RESUME_WINDOW_MS) {
+        video.play().catch(()=>{});
+    }
+});
 
 document.addEventListener('fullscreenchange', function(){
     if (document.fullscreenElement) {
-        wasPlayingBeforeFullscreenExit = !video.paused;
+        noteFullscreenEntered();
     } else {
-        handleFullscreenExit();
+        noteFullscreenExited();
     }
 });
 document.addEventListener('webkitfullscreenchange', function(){
     if (document.webkitFullscreenElement) {
-        wasPlayingBeforeFullscreenExit = !video.paused;
+        noteFullscreenEntered();
     } else {
-        handleFullscreenExit();
+        noteFullscreenExited();
     }
 });
-video.addEventListener('webkitbeginfullscreen', function(){
-    wasPlayingBeforeFullscreenExit = !video.paused;
-});
-video.addEventListener('webkitendfullscreen', function(){
-    handleFullscreenExit();
-});
+video.addEventListener('webkitbeginfullscreen', noteFullscreenEntered);
+video.addEventListener('webkitendfullscreen', noteFullscreenExited);
 
 function levelLabel(level){
     if(level.height)   return level.height + 'p';
