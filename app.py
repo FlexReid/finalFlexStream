@@ -1627,39 +1627,56 @@ button:active { transform: translateY(0); }
 }
 #quality:hover { background-color: rgba(10,10,12,0.9); }
 #bottomRightControls {
-  /* Sits above the native <video> controls bar (which includes its own
-     fullscreen icon in the bottom-right corner) rather than on top of it,
-     so nothing here overlaps/competes for taps with it. A flex row lets
-     the fullscreen button coexist alongside whichever of Next Episode /
-     Skip Intro happens to be showing, instead of them fighting over the
-     exact same spot. */
-  position: absolute; bottom: 58px; right: 14px; z-index: 100;
+  /* Now holds only Next Episode / Skip Intro — the custom fullscreen
+     button has its own separate slot below, in the native button's old
+     spot, rather than sharing this row. Raised higher above the native
+     controls bar since the buttons themselves are bigger too. */
+  position: absolute; bottom: 100px; right: 14px; z-index: 100;
   display: flex; align-items: center; gap: 8px;
 }
-#nextEpisodeBtn, #skipIntroBtn, #customFullscreenBtn {
+#nextEpisodeBtn, #skipIntroBtn {
   background: rgba(10,10,12,0.6); color: #fff; border: 1px solid rgba(255,255,255,0.2);
-  border-radius: 8px; padding: 9px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+  border-radius: 10px; padding: 12px 20px; font-size: 0.95rem; font-weight: 600; cursor: pointer;
   font-family: 'Inter', sans-serif; backdrop-filter: blur(6px);
   display: none; align-items: center; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
   transition: background 0.15s ease, transform 0.15s ease, opacity 0.25s ease;
 }
-#nextEpisodeBtn:hover, #skipIntroBtn:hover, #customFullscreenBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
+#nextEpisodeBtn:hover, #skipIntroBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
 #customFullscreenBtn {
-  /* Desktop only — mirrors how the native player's own controls (play,
-     seek, volume) fade out while just watching and only reappear on
-     mouse activity or while paused; this button follows the same rhythm
-     rather than sitting there permanently. Needs its own `display: flex`
-     here because the shared rule above defaults to `display: none` (for
-     Next Episode / Skip Intro, which get toggled to flex via JS) — without
-     this override the button stays display:none forever and the opacity/
-     pointer-events toggling below never gets a chance to show it. */
-  display: flex;
-  padding: 9px 12px; font-size: 1rem; line-height: 1;
+  /* Desktop only (see the display:none in the mobile block below, and the
+     matching native-button-hide media query further down) — sits exactly
+     where the native controls' own fullscreen icon used to be: flush in
+     the bottom-right corner of the controls bar. Positioned relative to
+     #video-container directly (it's now a sibling of #bottomRightControls,
+     not nested inside it) — nesting it inside that row previously made its
+     bottom/right offsets measure from the row's own position instead. */
+  position: absolute; bottom: 10px; right: 8px; z-index: 100;
+  background: --cyan; color: #fff; border: none;
+  border-radius: 6px; padding: 6px; font-size: 1.1rem; line-height: 1; cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
   opacity: 0; pointer-events: none;
+  box-shadow: none; transform: none; filter: none;
+  transition: opacity 0.2s ease, background 0.15s ease;
+}
+#customFullscreenBtn:hover {
+  background: rgba(255,255,255,0.15);
+  box-shadow: none; transform: none; filter: none;
 }
 #customFullscreenBtn.controls-visible { opacity: 1; pointer-events: auto; }
 @media (max-width: 768px) {
   #customFullscreenBtn { display: none !important; }
+}
+/* Native fullscreen icon is only hidden/replaced on desktop — on mobile
+   there's no custom button (see rule above), so removing the native one
+   there would leave no way to fullscreen at all. Firefox has no
+   equivalent pseudo-element hook for customizing native <video> controls,
+   so this is best-effort there. */
+@media (min-width: 769px) {
+  video::-webkit-media-controls-fullscreen-button {
+    display: none !important;
+  }
 }
 .autocomplete-dropdown {
   position: absolute; background: var(--bg-elevated-2); color: #fff; list-style: none;
@@ -1701,8 +1718,8 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
     width: 52px; height: 52px; display: none;
   }
   .spinner { width: 26px; height: 26px; border-width: 3px; }
-  #bottomRightControls { bottom: 48px; right: 10px; }
-  #nextEpisodeBtn, #skipIntroBtn { padding: 8px 12px; font-size: 0.78rem; }
+  #bottomRightControls { bottom: 58px; right: 10px; }
+  #nextEpisodeBtn, #skipIntroBtn { padding: 10px 14px; font-size: 0.85rem; }
   #downloadQuality { margin: 12px auto 0; width: 130px; height: 40px; line-height: 18px; padding: 0 10px; font-size: 0.85rem; }
 }
 /* Phone in landscape: keyed off height rather than width, since a rotated
@@ -1717,6 +1734,7 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   }
 }
 </style>
+</style>
 </head>
 <body>
 <h1><span class="cyan">Flex</span> Stream</h1>
@@ -1730,11 +1748,13 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
 <div id="video-container">
   <video id="video" controls crossorigin playsinline x-webkit-airplay="allow"></video>
   <select id="quality" style="display:none;"><option value="-1">Auto</option></select>
+  <button id="customFullscreenBtn" title="Fullscreen">&#9974;</button>
   <div id="bottomRightControls">
-    <button id="customFullscreenBtn" title="Fullscreen">&#9974;</button>
     <button id="nextEpisodeBtn">Next Episode &#9656;</button>
     <button id="skipIntroBtn">Skip Intro &#9656;</button>
   </div>
+  <div id="loading"><div class="spinner"></div></div>
+</div>
   <div id="loading"><div class="spinner"></div></div>
 </div>
 <button id="downloadBtn">Download MP4</button>
@@ -1964,6 +1984,23 @@ customFullscreenBtn.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenButtonIcon);
 document.addEventListener('webkitfullscreenchange', updateFullscreenButtonIcon);
 
+// The CSS pseudo-element above only hides the native fullscreen icon
+// visually; controlsList="nofullscreen" is what actually disables it
+// (and is what Chromium respects functionally). Kept in sync with a
+// matchMedia listener rather than a static HTML attribute so it also
+// reacts correctly if a desktop browser window gets resized across the
+// breakpoint, not just on initial page load.
+const DESKTOP_MQ = window.matchMedia('(min-width: 769px)');
+function syncNativeFullscreenControl(){
+    if (DESKTOP_MQ.matches) {
+        video.setAttribute('controlsList', 'nofullscreen');
+    } else {
+        video.removeAttribute('controlsList');
+    }
+}
+syncNativeFullscreenControl();
+DESKTOP_MQ.addEventListener('change', syncNativeFullscreenControl);
+
 // Fades the button in/out in step with the native player's own controls
 // (play/seek/volume): visible on mouse activity or while paused, hidden
 // again after a few seconds of inactivity during playback. No JS access
@@ -1976,16 +2013,21 @@ function showFloatingFullscreenButton(){
     if (!video.paused) {
         controlsIdleTimer = setTimeout(function(){
             customFullscreenBtn.classList.remove('controls-visible');
-        }, 3000);
+        }, 2000);
     }
+}
+function hideFloatingFullscreenButtonNow(){
+    if (video.paused) return; // native controls stay visible while paused
+    if (controlsIdleTimer) { clearTimeout(controlsIdleTimer); controlsIdleTimer = null; }
+    customFullscreenBtn.classList.remove('controls-visible');
 }
 videoContainer.addEventListener('mousemove', showFloatingFullscreenButton);
 videoContainer.addEventListener('mouseenter', showFloatingFullscreenButton);
+videoContainer.addEventListener('mouseleave', hideFloatingFullscreenButtonNow);
 videoContainer.addEventListener('click', showFloatingFullscreenButton);
 video.addEventListener('play', showFloatingFullscreenButton);
 video.addEventListener('pause', showFloatingFullscreenButton);
 showFloatingFullscreenButton(); // visible by default until playback actually starts
-
 // ── Mobile: "+10s" skip button during intro/outro ───────────────────────
 // iOS's native fullscreen player shows its own built-in "skip 10 seconds"
 // button that this page has no direct hook into — there's no discrete
