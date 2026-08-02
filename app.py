@@ -181,6 +181,10 @@ def get_player_iframe_src(vsrc_url: str) -> str:
     set_origin_from_url(src)
     return src
 
+# How long to wait after seeing a candidate .m3u8 request before trusting
+# it, in case a newer one supersedes it shortly after (see capture_first_m3u8).
+DEBOUNCE_SECONDS = 1.2
+
 def capture_first_m3u8(page_url: str, retries=3) -> str:
     def attempt() -> str:
         result = {"url": None}
@@ -261,6 +265,15 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                     except Exception:
                         pass
                 deadline = time.time() + 120
+                # Debounced candidate: the first .m3u8 URL we see is often a
+                # decoy/probe request the player fires before the real one —
+                # we've seen genuinely different master.m3u8 paths issued a
+                # second apart, where only the later one actually resolves.
+                # Rather than trusting the first match immediately, hold it
+                # for DEBOUNCE_SECONDS and only finalize once nothing newer
+                # has shown up in that window.
+                candidate_url = None
+                candidate_time = None
                 while time.time() < deadline:
                     if done.is_set():
                         break
@@ -274,14 +287,18 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                             if msg.get("method") == "Network.requestWillBeSent":
                                 url = msg["params"]["request"]["url"]
                                 if ".m3u8" in url:
-                                    with lock:
-                                        if not result["url"]:
-                                            result["url"] = url
-                                            debug(f"[Chrome] Captured m3u8: {url}")
-                                    done.set()
-                                    return
+                                    candidate_url = url
+                                    candidate_time = time.time()
+                                    debug(f"[Chrome] Candidate m3u8: {url}")
                         except Exception:
                             continue
+                    if candidate_url and (time.time() - candidate_time) >= DEBOUNCE_SECONDS:
+                        with lock:
+                            if not result["url"]:
+                                result["url"] = candidate_url
+                                debug(f"[Chrome] Captured m3u8 (settled after debounce): {candidate_url}")
+                        done.set()
+                        return
                     time.sleep(0.3)
             except Exception as e:
                 debug(f"[Chrome] Error: {e}")
@@ -306,14 +323,18 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                 context = browser.new_context()
                 page = context.new_page()
 
+                # Same debounce reasoning as the Chrome path above — hold a
+                # candidate briefly in case a newer .m3u8 request supersedes
+                # it before we commit to it.
+                pw_candidate = {"url": None, "time": None}
+
                 def on_request(req):
                     url = req.url
                     if ".m3u8" in url:
                         with lock:
-                            if not result["url"]:
-                                result["url"] = url
-                                debug(f"[Playwright] Captured m3u8: {url}")
-                        done.set()
+                            pw_candidate["url"] = url
+                            pw_candidate["time"] = time.time()
+                        debug(f"[Playwright] Candidate m3u8: {url}")
 
                 page.on("request", on_request)
                 try:
@@ -338,8 +359,17 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                     except Exception:
                         pass
 
-                for _ in range(60):
+                for _ in range(120):
                     if done.is_set():
+                        break
+                    with lock:
+                        cand_url, cand_time = pw_candidate["url"], pw_candidate["time"]
+                    if cand_url and not result["url"] and cand_time and (time.time() - cand_time) >= DEBOUNCE_SECONDS:
+                        with lock:
+                            if not result["url"]:
+                                result["url"] = cand_url
+                                debug(f"[Playwright] Captured m3u8 (settled after debounce): {cand_url}")
+                        done.set()
                         break
                     page.wait_for_timeout(500)
 
@@ -532,28 +562,16 @@ def fetch_playlist_bytes_with_fallback(url: str, max_retries_per_variant: int = 
     return last_bad or b''
 
 
+_PERMANENT_HTTP_STATUS_CODES = {403, 404, 410}
+
 def fetch_bytes_retry(url, max_retries=6, base_delay=1.5, headers=None):
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             r = requests.get(url, headers=headers or get_headers(), timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429 or r.status_code >= 500:
-                retry_after = r.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait = float(retry_after)
-                    except ValueError:
-                        wait = base_delay * (2 ** attempt)
-                else:
-                    wait = base_delay * (2 ** attempt)
-                wait = min(wait, 30)
-                if attempt < max_retries:
-                    debug(f"[fetch_bytes_retry] {r.status_code} on {url} — retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    continue
-            r.raise_for_status()
-            return r.content
         except requests.exceptions.RequestException as e:
+            # A real network-level failure (connection error, timeout,
+            # etc.) — this is the transient case retrying is meant for.
             last_exc = e
             if attempt < max_retries:
                 wait = base_delay * (2 ** attempt)
@@ -561,6 +579,37 @@ def fetch_bytes_retry(url, max_retries=6, base_delay=1.5, headers=None):
                 time.sleep(wait)
                 continue
             raise
+
+        if r.status_code in _PERMANENT_HTTP_STATUS_CODES:
+            # Genuinely gone/forbidden, not a transient blip — these
+            # ephemeral per-stream CDN links can just be dead on arrival.
+            # Retrying with backoff (or trying alternate header shapes)
+            # wastes tens of seconds to minutes waiting for a 404 to
+            # become a 200, which it essentially never does. Fail fast so
+            # the caller (fetch_bytes_with_fallback's next header variant,
+            # or the client's own "get a fresh link" recovery) can react
+            # right away instead of the person staring at a spinner.
+            debug(f"[fetch_bytes_retry] {r.status_code} on {url} — not retrying, this looks permanent")
+            r.raise_for_status()
+
+        if r.status_code == 429 or r.status_code >= 500:
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = base_delay * (2 ** attempt)
+            else:
+                wait = base_delay * (2 ** attempt)
+            wait = min(wait, 30)
+            if attempt < max_retries:
+                debug(f"[fetch_bytes_retry] {r.status_code} on {url} — retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+
+        r.raise_for_status()
+        return r.content
+
     if last_exc:
         raise last_exc
     raise RuntimeError(f"fetch_bytes_retry: exhausted retries for {url}")
@@ -617,6 +666,8 @@ def proxy_playlist():
         # fetch_bytes_with_fallback additionally tries alternate request
         # header shapes if a response comes back empty, in case that's the
         # CDN quietly soft-blocking rather than a real transient failure.
+        # Genuinely permanent errors (403/404/410) now fail immediately
+        # rather than retrying — see fetch_bytes_retry.
         pl_bytes = fetch_playlist_bytes_with_fallback(url, max_retries_per_variant=5, base_delay=1.2)
     except Exception as e:
         return f"Failed to fetch playlist: {e}", 502
@@ -1631,7 +1682,7 @@ button:active { transform: translateY(0); }
      button has its own separate slot below, in the native button's old
      spot, rather than sharing this row. Raised higher above the native
      controls bar since the buttons themselves are bigger too. */
-  position: absolute; bottom: 100px; right: 14px; z-index: 100;
+  position: absolute; bottom: 72px; right: 14px; z-index: 100;
   display: flex; align-items: center; gap: 8px;
 }
 #nextEpisodeBtn, #skipIntroBtn {
@@ -1644,17 +1695,17 @@ button:active { transform: translateY(0); }
 #nextEpisodeBtn:hover, #skipIntroBtn:hover { background: rgba(10,10,12,0.85); transform: translateY(-1px); }
 #customFullscreenBtn {
   /* Desktop only (see the display:none in the mobile block below, and the
-     matching native-button-hide media query further down) — sits exactly
-     where the native controls' own fullscreen icon used to be: flush in
-     the bottom-right corner of the controls bar. Positioned relative to
-     #video-container directly (it's now a sibling of #bottomRightControls,
-     not nested inside it) — nesting it inside that row previously made its
-     bottom/right offsets measure from the row's own position instead. */
-  position: absolute; bottom: 10px; right: 8px; z-index: 100;
-  background: --cyan; color: #fff; border: none;
+     matching native-button-hide media query further down) — positioned
+     relative to #video-container directly (it's a sibling of
+     #bottomRightControls in the HTML, not nested inside it), so it sits
+     flush in the bottom-right corner exactly where the native controls'
+     own fullscreen icon used to be, rather than measuring its offset from
+     the row above. */
+  position: absolute; bottom: 6px; right: 8px; z-index: 100;
+  background: transparent; color: #fff; border: none;
   border-radius: 6px; padding: 6px; font-size: 1.1rem; line-height: 1; cursor: pointer;
   font-family: 'Inter', sans-serif;
-  width: 20px; height: 20px;
+  width: 34px; height: 34px;
   display: flex; align-items: center; justify-content: center;
   opacity: 0; pointer-events: none;
   box-shadow: none; transform: none; filter: none;
@@ -1734,7 +1785,6 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
   }
 }
 </style>
-</style>
 </head>
 <body>
 <h1><span class="cyan">Flex</span> Stream</h1>
@@ -1753,8 +1803,6 @@ footer { margin-top: auto; padding-top: 24px; text-align: center; padding: 24px 
     <button id="nextEpisodeBtn">Next Episode &#9656;</button>
     <button id="skipIntroBtn">Skip Intro &#9656;</button>
   </div>
-  <div id="loading"><div class="spinner"></div></div>
-</div>
   <div id="loading"><div class="spinner"></div></div>
 </div>
 <button id="downloadBtn">Download MP4</button>
@@ -1984,12 +2032,12 @@ customFullscreenBtn.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenButtonIcon);
 document.addEventListener('webkitfullscreenchange', updateFullscreenButtonIcon);
 
-// The CSS pseudo-element above only hides the native fullscreen icon
-// visually; controlsList="nofullscreen" is what actually disables it
-// (and is what Chromium respects functionally). Kept in sync with a
-// matchMedia listener rather than a static HTML attribute so it also
-// reacts correctly if a desktop browser window gets resized across the
-// breakpoint, not just on initial page load.
+// The CSS pseudo-element hiding rule for the native fullscreen icon only
+// hides it visually in the browsers that expose that hook (Chrome/Edge/
+// Safari); controlsList="nofullscreen" is what actually disables it
+// functionally. Kept desktop-only and reactive to resizing via matchMedia
+// rather than a static HTML attribute, so it doesn't linger applied (or
+// stay absent) if the window crosses the breakpoint after load.
 const DESKTOP_MQ = window.matchMedia('(min-width: 769px)');
 function syncNativeFullscreenControl(){
     if (DESKTOP_MQ.matches) {
@@ -2001,11 +2049,14 @@ function syncNativeFullscreenControl(){
 syncNativeFullscreenControl();
 DESKTOP_MQ.addEventListener('change', syncNativeFullscreenControl);
 
-// Fades the button in/out in step with the native player's own controls
-// (play/seek/volume): visible on mouse activity or while paused, hidden
-// again after a few seconds of inactivity during playback. No JS access
-// to the browser's actual native-controls visibility state exists, so
-// this mirrors it with the same well-known idle-timeout pattern instead.
+// Fades the button in/out roughly in step with the native player's own
+// controls (play/seek/volume): visible on mouse activity/paused, hidden
+// again after a couple seconds of inactivity during playback, and hidden
+// immediately when the cursor leaves the video (matching how native
+// controls disappear the instant the mouse exits, rather than waiting out
+// the idle timer). There's no way to hook into the browser's actual
+// native-controls visibility state directly, so this is a simulation
+// tuned to match Chrome/Edge's default ~2s idle timeout.
 let controlsIdleTimer = null;
 function showFloatingFullscreenButton(){
     customFullscreenBtn.classList.add('controls-visible');
@@ -2028,6 +2079,7 @@ videoContainer.addEventListener('click', showFloatingFullscreenButton);
 video.addEventListener('play', showFloatingFullscreenButton);
 video.addEventListener('pause', showFloatingFullscreenButton);
 showFloatingFullscreenButton(); // visible by default until playback actually starts
+
 // ── Mobile: "+10s" skip button during intro/outro ───────────────────────
 // iOS's native fullscreen player shows its own built-in "skip 10 seconds"
 // button that this page has no direct hook into — there's no discrete
