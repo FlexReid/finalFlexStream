@@ -29,6 +29,10 @@ def set_origin_from_url(url: str):
     _current_origin["value"] = origin
     debug(f"Origin/Referer locked to: {origin}")
 
+def _origin_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
 def get_headers() -> dict:
     origin = _current_origin["value"] or "https://cloudorchestranova.com"
     return {
@@ -37,10 +41,16 @@ def get_headers() -> dict:
         "Referer": origin + "/",
     }
 
-_stream_origins = {}
-_stream_origins_lock = threading.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-host Origin/Referer for proxying playlists/segments. These now come
+# straight from the browser's own request to generate.php (the endpoint the
+# CDN actually authenticates the stream against) rather than being derived
+# from the embed iframe's own URL — see capture_first_m3u8.
+# ─────────────────────────────────────────────────────────────────────────────
+_stream_headers = {}
+_stream_headers_lock = threading.Lock()
 
-def remember_stream_origin(url_for_host: str, origin: str):
+def remember_stream_headers(url_for_host: str, headers: dict):
     """Associates the Origin/Referer to send with a CDN *host* (not the
     exact URL) — variant playlists and segments share the master's host but
     aren't the same URL, so keying by host lets /proxy_playlist and
@@ -50,20 +60,30 @@ def remember_stream_origin(url_for_host: str, origin: str):
     can't corrupt headers for a host the live stream has already recorded.
     """
     host = urlparse(url_for_host).netloc
-    if not host or not origin:
+    if not host or not headers:
         return
-    with _stream_origins_lock:
-        _stream_origins[host] = origin
-        if len(_stream_origins) > 200:
-            oldest_key = next(iter(_stream_origins))
-            del _stream_origins[oldest_key]
+    origin = headers.get("Origin")
+    referer = headers.get("Referer")
+    if not origin and not referer:
+        return
+    with _stream_headers_lock:
+        _stream_headers[host] = {"Origin": origin, "Referer": referer}
+        if len(_stream_headers) > 200:
+            oldest_key = next(iter(_stream_headers))
+            del _stream_headers[oldest_key]
 
 def get_headers_for_stream(url: str) -> dict:
     host = urlparse(url).netloc
-    with _stream_origins_lock:
-        origin = _stream_origins.get(host)
-    if not origin:
-        origin = _current_origin["value"] or "https://cloudorchestranova.com"
+    with _stream_headers_lock:
+        stored = _stream_headers.get(host)
+    if stored and (stored.get("Origin") or stored.get("Referer")):
+        h = {"User-Agent": "Mozilla/5.0"}
+        if stored.get("Origin"):
+            h["Origin"] = stored["Origin"]
+        if stored.get("Referer"):
+            h["Referer"] = stored["Referer"]
+        return h
+    origin = _current_origin["value"] or "https://cloudorchestranova.com"
     return {
         "User-Agent": "Mozilla/5.0",
         "Origin": origin,
@@ -165,42 +185,129 @@ def get_episodes():
         return jsonify([])
     return jsonify(get_released_episodes(tmdb_id, int(season)))
 
-def get_player_iframe_src(vsrc_url: str) -> str:
-    debug(f"Fetching vsrc page: {vsrc_url}")
-    r = requests.get(vsrc_url, headers=get_headers(), timeout=10)
-    m = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', r.text)
-    if not m:
-        debug("No iframe src found in vsrc page")
-        return None
-    src = m.group(1)
-    if src.startswith("//"):
-        src = "https:" + src
-    elif src.startswith("/"):
-        src = urljoin(vsrc_url, src)
-    debug(f"Resolved iframe URL: {src}")
-    set_origin_from_url(src)
-    return src
+# ─────────────────────────────────────────────────────────────────────────────
+# m3u8 capture
+#
+# Previously this fetched the vsrc embed page with a plain HTTP request,
+# regexed the <iframe src=...> out of it, and loaded THAT resolved iframe
+# URL directly in the browser. Now the browser loads the vsrc embed URL
+# itself — the iframe is just part of the page and the browser resolves it
+# naturally, so there's no separate manual HTTP+regex step. Because the
+# player's actual DOM now often lives inside a nested iframe rather than
+# being the top-level document, play-button clicking has to search across
+# frames too (see both branches below).
+#
+# Origin/Referer are no longer derived from the iframe's own host — they're
+# read directly from the browser's own request to generate.php, which is
+# what the CDN actually authenticates the stream against. generate.php's
+# response body also contains the playback token, read directly from
+# source rather than parsed back out of the captured m3u8 URL's query
+# string (which may not always carry it).
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOKEN_SOURCE_HINT = "generate.php"
 
 # How long to wait after seeing a candidate .m3u8 request before trusting
-# it, in case a newer one supersedes it shortly after (see capture_first_m3u8).
+# it, in case a newer one supersedes it shortly after (some sources issue
+# a decoy/probe manifest request before the real one).
 DEBOUNCE_SECONDS = 1.2
 
-def capture_first_m3u8(page_url: str, retries=3) -> str:
-    def attempt() -> str:
-        result = {"url": None}
+
+def _extract_token_from_text(text):
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("token", "access_token", "playback_token", "authToken"):
+                val = data.get(key)
+                if isinstance(val, str) and val:
+                    return val
+    except Exception:
+        pass
+    m = re.search(r'token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-\.]{20,})', text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _headers_from_cdp_request(header_dict):
+    """CDP's Network.requestWillBeSent already gives headers as a plain
+    dict keyed however the browser sent them (case can vary)."""
+    if not isinstance(header_dict, dict):
+        return {}
+    lower = {k.lower(): v for k, v in header_dict.items()}
+    return {"Origin": lower.get("origin"), "Referer": lower.get("referer")}
+
+
+def capture_first_m3u8(page_url: str, retries=3):
+    """Loads page_url (the vsrc embed URL) directly in the browser and
+    captures the master .m3u8 URL along with the Origin/Referer/token
+    harvested from the generate.php request/response.
+
+    Returns (m3u8_url, headers) where headers is {"Origin":..., "Referer":...}
+    (falls back to a same-origin guess if generate.php was never observed),
+    or (None, None) if nothing could be captured.
+    """
+    def attempt():
+        result = {"url": None, "headers": {}, "token": None}
         lock = threading.Lock()
         done = threading.Event()
         chrome_failed = threading.Event()
 
+        def click_play_chrome(driver):
+            selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
+            for sel in selectors:
+                try:
+                    el = driver.find_element("css selector", sel)
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+                except Exception:
+                    continue
+            # Not found in the top-level document — the player is likely
+            # nested inside an iframe now that we load the embed page
+            # directly rather than resolving straight to the iframe's own
+            # URL. Search each iframe in turn.
+            try:
+                iframes = driver.find_elements("tag name", "iframe")
+            except Exception:
+                iframes = []
+            for iframe in iframes:
+                try:
+                    driver.switch_to.frame(iframe)
+                except Exception:
+                    continue
+                clicked = False
+                for sel in selectors:
+                    try:
+                        el = driver.find_element("css selector", sel)
+                        driver.execute_script("arguments[0].click();", el)
+                        clicked = True
+                        break
+                    except Exception:
+                        continue
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                if clicked:
+                    return True
+            return False
+
         def chrome_worker():
+            import undetected_chromedriver as uc
+            from seleniumwire import webdriver
+            import shutil as _shutil
+
             chrome_version = get_chrome_major_version()
             chromium_binary = get_chromium_binary()
-            options = uc.ChromeOptions()
+
+            options = webdriver.ChromeOptions()
             if chromium_binary:
                 options.binary_location = chromium_binary
+
             options.add_argument("--no-sandbox")
             options.add_argument("--window-size=1280,720")
-            options.add_argument("--remote-debugging-port=0")
             options.add_argument("--disable-setuid-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
@@ -211,107 +318,126 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
             options.add_argument("--disable-background-networking")
             options.add_argument("--disable-default-apps")
             options.add_argument("--mute-audio")
-            options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
             options.page_load_strategy = "eager"
 
-            import shutil as _shutil
             home_chromedriver = os.path.expanduser("~/chromedriver")
             system_chromedriver = None
+
             if not os.path.isfile(home_chromedriver):
-                for src in ["/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver","/usr/lib/chromium/chromedriver"]:
+                for src in [
+                    "/usr/bin/chromedriver",
+                    "/usr/lib/chromium-browser/chromedriver",
+                    "/usr/lib/chromium/chromedriver",
+                ]:
                     if os.path.isfile(src):
                         try:
                             _shutil.copy2(src, home_chromedriver)
                             os.chmod(home_chromedriver, 0o755)
-                            debug(f"[Chrome] Copied chromedriver from {src} to {home_chromedriver}")
+                            debug(f"[Chrome] Copied chromedriver from {src}")
                         except Exception as copy_err:
                             debug(f"[Chrome] Could not copy chromedriver: {copy_err}")
                         break
+
             if os.path.isfile(home_chromedriver) and os.access(home_chromedriver, os.X_OK):
                 system_chromedriver = home_chromedriver
                 debug(f"[Chrome] Using writable chromedriver: {home_chromedriver}")
             else:
-                for candidate in ["/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver","/usr/lib/chromium/chromedriver"]:
+                for candidate in [
+                    "/usr/bin/chromedriver",
+                    "/usr/lib/chromium-browser/chromedriver",
+                    "/usr/lib/chromium/chromedriver",
+                ]:
                     if os.path.isfile(candidate):
                         system_chromedriver = candidate
                         debug(f"[Chrome] Using system chromedriver: {candidate}")
                         break
 
-            kwargs = {"options": options, "use_subprocess": True}
-            if chrome_version:
-                kwargs["version_main"] = chrome_version
+            # selenium-wire's webdriver.Chrome wraps *plain* Selenium's
+            # Chrome class, not undetected_chromedriver's — it does not
+            # accept uc-specific kwargs like version_main or
+            # driver_executable_path (passing them raises exactly the
+            # "unexpected keyword argument" TypeError seen in production).
+            # Selenium 4's actual API takes the chromedriver path via a
+            # Service object instead.
+            from selenium.webdriver.chrome.service import Service as ChromeService
+
+            kwargs = {"options": options}
             if system_chromedriver:
-                kwargs["driver_executable_path"] = system_chromedriver
+                kwargs["service"] = ChromeService(executable_path=system_chromedriver)
+
             os.environ.setdefault("DISPLAY", ":0")
+
             driver = None
+
             try:
-                driver = uc.Chrome(**kwargs)
-                debug("[Chrome] Browser launched")
+                driver = webdriver.Chrome(**kwargs)
+                debug("[Chrome] Browser launched via selenium-wire")
+
                 driver.get(page_url)
-                try:
-                    driver.get_log("performance")
-                except Exception:
-                    pass
-                for sel in ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]:
-                    try:
-                        el = driver.find_element("css selector", sel)
-                        driver.execute_script("arguments[0].click();", el)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    try:
-                        driver.execute_script("document.elementFromPoint(640, 360)?.click();")
-                    except Exception:
-                        pass
+                click_play_chrome(driver)
+
                 deadline = time.time() + 120
-                # Debounced candidate: the first .m3u8 URL we see is often a
-                # decoy/probe request the player fires before the real one —
-                # we've seen genuinely different master.m3u8 paths issued a
-                # second apart, where only the later one actually resolves.
-                # Rather than trusting the first match immediately, hold it
-                # for DEBOUNCE_SECONDS and only finalize once nothing newer
-                # has shown up in that window.
                 candidate_url = None
                 candidate_time = None
+
                 while time.time() < deadline:
                     if done.is_set():
                         break
-                    try:
-                        logs = driver.get_log("performance")
-                    except Exception:
-                        break
-                    for entry in logs:
-                        try:
-                            msg = json.loads(entry["message"])["message"]
-                            if msg.get("method") == "Network.requestWillBeSent":
-                                url = msg["params"]["request"]["url"]
-                                if ".m3u8" in url:
-                                    candidate_url = url
-                                    candidate_time = time.time()
-                                    debug(f"[Chrome] Candidate m3u8: {url}")
-                        except Exception:
+
+                    for request in driver.requests:
+                        if not request.response:
                             continue
+
+                        url = request.url
+
+                        if TOKEN_SOURCE_HINT in url:
+                            hdrs = dict(request.headers)
+                            if hdrs.get("Origin") or hdrs.get("Referer"):
+                                with lock:
+                                    result["headers"] = hdrs
+                                debug(f"[Chrome] Captured headers: {hdrs}")
+
+                            try:
+                                body = request.response.body.decode("utf-8", errors="ignore")
+                                token = _extract_token_from_text(body)
+                                if token:
+                                    with lock:
+                                        result["token"] = token
+                                    debug("[Chrome] Extracted token")
+                            except Exception as e:
+                                debug(f"[Chrome] Token extraction failed: {e}")
+
+                        if ".m3u8" in url:
+                            candidate_url = url
+                            candidate_time = time.time()
+                            debug(f"[Chrome] Candidate m3u8: {url}")
+
                     if candidate_url and (time.time() - candidate_time) >= DEBOUNCE_SECONDS:
                         with lock:
                             if not result["url"]:
                                 result["url"] = candidate_url
-                                debug(f"[Chrome] Captured m3u8 (settled after debounce): {candidate_url}")
+                                debug(f"[Chrome] Captured m3u8 (debounced): {candidate_url}")
                         done.set()
                         return
-                    time.sleep(0.3)
+
+                    time.sleep(0.5)
+
             except Exception as e:
                 debug(f"[Chrome] Error: {e}")
+
             finally:
                 if driver:
                     try:
                         driver.quit()
                     except Exception:
                         pass
+
                 if not done.is_set():
                     debug("[Chrome] Exited without capturing m3u8")
                     chrome_failed.set()
                     done.set()
+
 
         chrome_thread = threading.Thread(target=chrome_worker, daemon=True)
         chrome_thread.start()
@@ -323,36 +449,63 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
                 context = browser.new_context()
                 page = context.new_page()
 
-                # Same debounce reasoning as the Chrome path above — hold a
-                # candidate briefly in case a newer .m3u8 request supersedes
-                # it before we commit to it.
                 pw_candidate = {"url": None, "time": None}
 
                 def on_request(req):
                     url = req.url
+                    if TOKEN_SOURCE_HINT in url:
+                        try:
+                            hdrs = req.headers
+                        except Exception:
+                            hdrs = {}
+                        origin = hdrs.get("origin")
+                        referer = hdrs.get("referer")
+                        if origin or referer:
+                            with lock:
+                                result["headers"] = {"Origin": origin, "Referer": referer}
+                            debug(f"[Playwright] generate.php request headers captured: Origin={origin} Referer={referer}")
                     if ".m3u8" in url:
                         with lock:
                             pw_candidate["url"] = url
                             pw_candidate["time"] = time.time()
                         debug(f"[Playwright] Candidate m3u8: {url}")
 
+                def on_response(resp):
+                    if TOKEN_SOURCE_HINT in resp.url:
+                        try:
+                            text = resp.text()
+                        except Exception:
+                            text = None
+                        token = _extract_token_from_text(text)
+                        if token:
+                            with lock:
+                                result["token"] = token
+                            debug("[Playwright] Extracted token from generate.php response")
+
                 page.on("request", on_request)
+                page.on("response", on_response)
                 try:
                     page.goto(page_url, wait_until="load", timeout=30000)
                 except Exception as e:
                     debug(f"[Playwright] Page load error: {e}")
 
+                # The player's DOM is often inside a nested iframe now that
+                # we load the embed page directly, so search every frame
+                # (not just the main page) for something clickable.
                 selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
                 clicked = False
-                for sel in selectors:
-                    try:
-                        el = page.query_selector(sel)
-                        if el:
-                            el.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
+                for frame in page.frames:
+                    for sel in selectors:
+                        try:
+                            el = frame.query_selector(sel)
+                            if el:
+                                el.click()
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+                    if clicked:
+                        break
                 if not clicked:
                     try:
                         page.mouse.click(640, 360)
@@ -386,20 +539,34 @@ def capture_first_m3u8(page_url: str, retries=3) -> str:
         chrome_thread.join(timeout=5)
 
         if chrome_failed.is_set() and not result["url"]:
-            return None
+            return None, {}, None
 
-        return result["url"]
+        return result["url"], result["headers"], result["token"]
 
     for attempt_num in range(1, retries + 1):
         debug(f"[capture] Attempt {attempt_num}/{retries}")
-        url = attempt()
+        url, headers, token = attempt()
         if url:
+            # Prefer the token read directly from generate.php's response
+            # body over whatever (if anything) already sits on the
+            # captured URL's own query string.
+            if token:
+                parts = urlparse(url)
+                qs = parse_qs(parts.query)
+                qs["token"] = [token]
+                url = urlunparse(parts._replace(query=urlencode(qs, doseq=True)))
+            page_origin = _origin_from_url(page_url)
+            resolved_headers = {
+                "Origin": headers.get("Origin") or page_origin,
+                "Referer": headers.get("Referer") or (page_origin + "/"),
+            }
             debug(f"Final m3u8 (attempt {attempt_num}): {url}")
-            return url
+            debug(f"Resolved stream headers (attempt {attempt_num}): {resolved_headers}")
+            return url, resolved_headers
         debug(f"[capture] Attempt {attempt_num} failed, retrying...")
 
     debug("All capture attempts failed")
-    return None
+    return None, None
 
 def get_best_variant(m3u8_url: str) -> str:
     debug(f"Fetching m3u8 to find best variant: {m3u8_url}")
@@ -485,8 +652,9 @@ def _request_header_variants(url: str):
     base = get_headers_for_stream(url)
     ua = base.get("User-Agent", "Mozilla/5.0")
 
-    # 1) Exactly what every other request in this proxy uses: spoofed
-    #    Origin/Referer pointed at the site that issued the stream.
+    # 1) Exactly what every other request in this proxy uses: the actual
+    #    Origin/Referer captured from the browser's own generate.php
+    #    request (or a same-origin guess if that was never observed).
     variant_normal = dict(base)
 
     # 2) No Origin/Referer at all. If the CDN is actually doing a strict
@@ -1174,18 +1342,18 @@ def get_m3u8():
     else:
         vsrc_embed = f"https://vsrc.su/embed/movie?imdb={imdb_id}&dts=dd"
 
-    iframe_src = get_player_iframe_src(vsrc_embed)
-    if not iframe_src:
-        return "", 404
-    update_msg.append(f"Iframe src obtained: {iframe_src}")
-
-    first_m3u8 = capture_first_m3u8(iframe_src, retries=3)
+    # Loads vsrc_embed directly in the browser — no more manually fetching
+    # the embed page over plain HTTP and regexing the iframe out of it
+    # beforehand. The browser resolves the iframe naturally as part of
+    # rendering the page, and headers/token are harvested from the actual
+    # generate.php request/response observed during that render.
+    first_m3u8, stream_headers = capture_first_m3u8(vsrc_embed, retries=3)
     if not first_m3u8:
         return "", 404
     update_msg.append(f"First m3u8 captured: {first_m3u8}")
     debug("\n".join(update_msg))
 
-    remember_stream_origin(first_m3u8, _current_origin["value"])
+    remember_stream_headers(first_m3u8, stream_headers)
     return first_m3u8
 
 
@@ -1342,17 +1510,15 @@ def get_intro():
 def _resolve_tv_episode_stream(tmdb_id: int, season: int, episode: int):
     """Same resolution pipeline as /get_m3u8's TV branch, but starting from
     an already-known tmdb_id instead of a title search — used for
-    prescraping the next episode in the background."""
+    prescraping the next episode in the background. Returns (m3u8, headers)
+    same as capture_first_m3u8."""
     external_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
     external_resp = requests.get(external_url, timeout=REQUEST_TIMEOUT).json()
     imdb_id = external_resp.get("imdb_id")
     if not imdb_id:
-        return None
+        return None, None
     vsrc_embed = f"https://vsrc.su/embed/tv?imdb={imdb_id}&season={season}&episode={episode}&dts=dd"
-    iframe_src = get_player_iframe_src(vsrc_embed)
-    if not iframe_src:
-        return None
-    return capture_first_m3u8(iframe_src, retries=3)
+    return capture_first_m3u8(vsrc_embed, retries=3)
 
 
 def _run_prescrape_job(key: str, tmdb_id: int, season: int, episode: int):
@@ -1361,13 +1527,13 @@ def _run_prescrape_job(key: str, tmdb_id: int, season: int, episode: int):
     # prescrape running alongside an actively-playing stream doesn't leave
     # that global origin pointed at the wrong show any longer than the
     # scrape itself takes — the per-host header cache (remember_stream_
-    # origin/get_headers_for_stream) is the real protection for the live
+    # headers/get_headers_for_stream) is the real protection for the live
     # stream's own proxy requests; this is just belt-and-suspenders.
     saved_origin = _current_origin["value"]
     try:
-        m3u8 = _resolve_tv_episode_stream(tmdb_id, season, episode)
+        m3u8, stream_headers = _resolve_tv_episode_stream(tmdb_id, season, episode)
         if m3u8:
-            remember_stream_origin(m3u8, _current_origin["value"])
+            remember_stream_headers(m3u8, stream_headers)
         with _prescrape_lock:
             _prescrape_cache[key] = {"status": "done" if m3u8 else "error", "m3u8": m3u8, "ts": time.time()}
         debug(f"[prescrape {key}] {'captured ' + m3u8 if m3u8 else 'failed to capture'}")
