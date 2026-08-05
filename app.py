@@ -207,6 +207,14 @@ def get_episodes():
 
 TOKEN_SOURCE_HINT = "generate.php"
 
+# Scripts the page tries to load that we want to prevent from ever
+# executing — the same effect as manually right-clicking a request in
+# Chrome DevTools' Network tab and choosing "Block request URL". Matched
+# as a plain substring against the full request URL (not a glob/regex),
+# so these just need to be distinctive enough not to false-positive on
+# something unrelated.
+BLOCKED_SCRIPT_PATTERNS = ["sbx.js", "disable-devtool.js", "t_.js"]
+
 # How long to wait after seeing a candidate .m3u8 request before trusting
 # it, in case a newer one supersedes it shortly after (some sources issue
 # a decoy/probe manifest request before the real one).
@@ -255,19 +263,28 @@ def capture_first_m3u8(page_url: str, retries=3):
         done = threading.Event()
         chrome_failed = threading.Event()
 
-        def click_play_chrome(driver):
-            selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
-            for sel in selectors:
+        PLAY_SELECTORS = [
+            "button.vjs-play-control", ".vjs-big-play-button",
+            ".jw-icon-play", ".jw-icon-display",
+            ".play-btn", ".plyr__control--overlaid",
+            "[aria-label='Play']", "[aria-label='play']",
+            ".ytp-large-play-button", "video",
+        ]
+
+        def _find_and_click(driver, max_depth=3):
+            """Searches the current frame context, then recurses into
+            nested iframes (up to max_depth levels), clicking the first
+            matching selector found anywhere. Returns True if something
+            was clicked."""
+            for sel in PLAY_SELECTORS:
                 try:
                     el = driver.find_element("css selector", sel)
                     driver.execute_script("arguments[0].click();", el)
                     return True
                 except Exception:
                     continue
-            # Not found in the top-level document — the player is likely
-            # nested inside an iframe now that we load the embed page
-            # directly rather than resolving straight to the iframe's own
-            # URL. Search each iframe in turn.
+            if max_depth <= 0:
+                return False
             try:
                 iframes = driver.find_elements("tag name", "iframe")
             except Exception:
@@ -277,21 +294,51 @@ def capture_first_m3u8(page_url: str, retries=3):
                     driver.switch_to.frame(iframe)
                 except Exception:
                     continue
-                clicked = False
-                for sel in selectors:
+                clicked = _find_and_click(driver, max_depth - 1)
+                try:
+                    driver.switch_to.parent_frame()
+                except Exception:
                     try:
-                        el = driver.find_element("css selector", sel)
-                        driver.execute_script("arguments[0].click();", el)
-                        clicked = True
-                        break
+                        driver.switch_to.default_content()
                     except Exception:
-                        continue
+                        pass
+                if clicked:
+                    return True
+            return False
+
+        def click_play_chrome(driver):
+            # The player often isn't fully initialized right when the
+            # page's 'load' event fires (especially now that some of its
+            # bootstrap scripts are blocked) — retry for a few seconds
+            # rather than giving up after a single immediate attempt.
+            for _ in range(8):
                 try:
                     driver.switch_to.default_content()
                 except Exception:
                     pass
-                if clicked:
+                if _find_and_click(driver):
                     return True
+                time.sleep(0.4)
+            # Nothing matched any selector, anywhere. Fall back to a
+            # synthetic mouse click via CDP (a "real" trusted-looking
+            # click, unlike a JS .click() call) at the center of the
+            # viewport, then a plain JS elementFromPoint click as a last
+            # resort.
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+            try:
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mousePressed", "x": 640, "y": 360, "button": "left", "clickCount": 1})
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": 640, "y": 360, "button": "left", "clickCount": 1})
+                return True
+            except Exception:
+                pass
+            try:
+                driver.execute_script("document.elementFromPoint(640, 360)?.click();")
+                return True
+            except Exception:
+                pass
             return False
 
         def chrome_worker():
@@ -353,6 +400,14 @@ def capture_first_m3u8(page_url: str, retries=3):
                     driver.execute_cdp_cmd("Network.enable", {})
                 except Exception:
                     pass
+                try:
+                    driver.execute_cdp_cmd(
+                        "Network.setBlockedURLs",
+                        {"urls": [f"*{name}*" for name in BLOCKED_SCRIPT_PATTERNS]},
+                    )
+                    debug(f"[Chrome] Blocking scripts: {BLOCKED_SCRIPT_PATTERNS}")
+                except Exception as e:
+                    debug(f"[Chrome] Could not set blocked URLs: {e}")
                 driver.get(page_url)
                 try:
                     driver.get_log("performance")
@@ -436,6 +491,16 @@ def capture_first_m3u8(page_url: str, retries=3):
                 context = browser.new_context()
                 page = context.new_page()
 
+                def _block_scripts(route):
+                    url = route.request.url
+                    if any(name in url for name in BLOCKED_SCRIPT_PATTERNS):
+                        debug(f"[Playwright] Blocking script: {url}")
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                page.route("**/*", _block_scripts)
+
                 pw_candidate = {"url": None, "time": None}
 
                 def on_request(req):
@@ -478,21 +543,27 @@ def capture_first_m3u8(page_url: str, retries=3):
 
                 # The player's DOM is often inside a nested iframe now that
                 # we load the embed page directly, so search every frame
-                # (not just the main page) for something clickable.
-                selectors = ["button.vjs-play-control", ".jw-icon-play", ".play-btn", "video"]
+                # (not just the main page) for something clickable. Retry
+                # for a few seconds too — the player often isn't fully
+                # initialized right when 'load' fires, especially now that
+                # some of its bootstrap scripts are blocked.
                 clicked = False
-                for frame in page.frames:
-                    for sel in selectors:
-                        try:
-                            el = frame.query_selector(sel)
-                            if el:
-                                el.click()
-                                clicked = True
-                                break
-                        except Exception:
-                            continue
+                for _ in range(8):
+                    for frame in page.frames:
+                        for sel in PLAY_SELECTORS:
+                            try:
+                                el = frame.query_selector(sel)
+                                if el:
+                                    el.click()
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+                        if clicked:
+                            break
                     if clicked:
                         break
+                    page.wait_for_timeout(400)
                 if not clicked:
                     try:
                         page.mouse.click(640, 360)
