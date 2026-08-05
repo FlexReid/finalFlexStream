@@ -295,19 +295,14 @@ def capture_first_m3u8(page_url: str, retries=3):
             return False
 
         def chrome_worker():
-            import undetected_chromedriver as uc
-            from seleniumwire import webdriver
-            import shutil as _shutil
-
             chrome_version = get_chrome_major_version()
             chromium_binary = get_chromium_binary()
-
-            options = webdriver.ChromeOptions()
+            options = uc.ChromeOptions()
             if chromium_binary:
                 options.binary_location = chromium_binary
-
             options.add_argument("--no-sandbox")
             options.add_argument("--window-size=1280,720")
+            options.add_argument("--remote-debugging-port=0")
             options.add_argument("--disable-setuid-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
@@ -318,126 +313,118 @@ def capture_first_m3u8(page_url: str, retries=3):
             options.add_argument("--disable-background-networking")
             options.add_argument("--disable-default-apps")
             options.add_argument("--mute-audio")
-
+            options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
             options.page_load_strategy = "eager"
 
+            import shutil as _shutil
             home_chromedriver = os.path.expanduser("~/chromedriver")
             system_chromedriver = None
-
             if not os.path.isfile(home_chromedriver):
-                for src in [
-                    "/usr/bin/chromedriver",
-                    "/usr/lib/chromium-browser/chromedriver",
-                    "/usr/lib/chromium/chromedriver",
-                ]:
+                for src in ["/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver","/usr/lib/chromium/chromedriver"]:
                     if os.path.isfile(src):
                         try:
                             _shutil.copy2(src, home_chromedriver)
                             os.chmod(home_chromedriver, 0o755)
-                            debug(f"[Chrome] Copied chromedriver from {src}")
+                            debug(f"[Chrome] Copied chromedriver from {src} to {home_chromedriver}")
                         except Exception as copy_err:
                             debug(f"[Chrome] Could not copy chromedriver: {copy_err}")
                         break
-
             if os.path.isfile(home_chromedriver) and os.access(home_chromedriver, os.X_OK):
                 system_chromedriver = home_chromedriver
                 debug(f"[Chrome] Using writable chromedriver: {home_chromedriver}")
             else:
-                for candidate in [
-                    "/usr/bin/chromedriver",
-                    "/usr/lib/chromium-browser/chromedriver",
-                    "/usr/lib/chromium/chromedriver",
-                ]:
+                for candidate in ["/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver","/usr/lib/chromium/chromedriver"]:
                     if os.path.isfile(candidate):
                         system_chromedriver = candidate
                         debug(f"[Chrome] Using system chromedriver: {candidate}")
                         break
 
-            # selenium-wire's webdriver.Chrome wraps *plain* Selenium's
-            # Chrome class, not undetected_chromedriver's — it does not
-            # accept uc-specific kwargs like version_main or
-            # driver_executable_path (passing them raises exactly the
-            # "unexpected keyword argument" TypeError seen in production).
-            # Selenium 4's actual API takes the chromedriver path via a
-            # Service object instead.
-            from selenium.webdriver.chrome.service import Service as ChromeService
-
-            kwargs = {"options": options}
+            kwargs = {"options": options, "use_subprocess": True}
+            if chrome_version:
+                kwargs["version_main"] = chrome_version
             if system_chromedriver:
-                kwargs["service"] = ChromeService(executable_path=system_chromedriver)
-
+                kwargs["driver_executable_path"] = system_chromedriver
             os.environ.setdefault("DISPLAY", ":0")
-
             driver = None
-
             try:
-                driver = webdriver.Chrome(**kwargs)
-                debug("[Chrome] Browser launched via selenium-wire")
-
+                driver = uc.Chrome(**kwargs)
+                debug("[Chrome] Browser launched")
+                try:
+                    driver.execute_cdp_cmd("Network.enable", {})
+                except Exception:
+                    pass
                 driver.get(page_url)
+                try:
+                    driver.get_log("performance")
+                except Exception:
+                    pass
                 click_play_chrome(driver)
 
                 deadline = time.time() + 120
                 candidate_url = None
                 candidate_time = None
-
+                seen_response_ids = set()
                 while time.time() < deadline:
                     if done.is_set():
                         break
-
-                    for request in driver.requests:
-                        if not request.response:
+                    try:
+                        logs = driver.get_log("performance")
+                    except Exception:
+                        break
+                    for entry in logs:
+                        try:
+                            msg = json.loads(entry["message"])["message"]
+                            method = msg.get("method")
+                            if method == "Network.requestWillBeSent":
+                                req = msg["params"]["request"]
+                                url = req.get("url", "")
+                                if TOKEN_SOURCE_HINT in url:
+                                    hdrs = _headers_from_cdp_request(req.get("headers", {}))
+                                    if hdrs.get("Origin") or hdrs.get("Referer"):
+                                        with lock:
+                                            result["headers"] = hdrs
+                                        debug(f"[Chrome] generate.php request headers captured: {hdrs}")
+                                if ".m3u8" in url:
+                                    candidate_url = url
+                                    candidate_time = time.time()
+                                    debug(f"[Chrome] Candidate m3u8: {url}")
+                            elif method == "Network.responseReceived":
+                                resp = msg["params"]["response"]
+                                if TOKEN_SOURCE_HINT in resp.get("url", ""):
+                                    request_id = msg["params"]["requestId"]
+                                    if request_id not in seen_response_ids:
+                                        seen_response_ids.add(request_id)
+                                        try:
+                                            body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
+                                            token = _extract_token_from_text(body.get("body", ""))
+                                            if token:
+                                                with lock:
+                                                    result["token"] = token
+                                                debug("[Chrome] Extracted token from generate.php response")
+                                        except Exception as body_err:
+                                            debug(f"[Chrome] Could not read generate.php response body: {body_err}")
+                        except Exception:
                             continue
-
-                        url = request.url
-
-                        if TOKEN_SOURCE_HINT in url:
-                            hdrs = dict(request.headers)
-                            if hdrs.get("Origin") or hdrs.get("Referer"):
-                                with lock:
-                                    result["headers"] = hdrs
-                                debug(f"[Chrome] Captured headers: {hdrs}")
-
-                            try:
-                                body = request.response.body.decode("utf-8", errors="ignore")
-                                token = _extract_token_from_text(body)
-                                if token:
-                                    with lock:
-                                        result["token"] = token
-                                    debug("[Chrome] Extracted token")
-                            except Exception as e:
-                                debug(f"[Chrome] Token extraction failed: {e}")
-
-                        if ".m3u8" in url:
-                            candidate_url = url
-                            candidate_time = time.time()
-                            debug(f"[Chrome] Candidate m3u8: {url}")
-
                     if candidate_url and (time.time() - candidate_time) >= DEBOUNCE_SECONDS:
                         with lock:
                             if not result["url"]:
                                 result["url"] = candidate_url
-                                debug(f"[Chrome] Captured m3u8 (debounced): {candidate_url}")
+                                debug(f"[Chrome] Captured m3u8 (settled after debounce): {candidate_url}")
                         done.set()
                         return
-
-                    time.sleep(0.5)
-
+                    time.sleep(0.3)
             except Exception as e:
                 debug(f"[Chrome] Error: {e}")
-
             finally:
                 if driver:
                     try:
                         driver.quit()
                     except Exception:
                         pass
-
                 if not done.is_set():
                     debug("[Chrome] Exited without capturing m3u8")
                     chrome_failed.set()
                     done.set()
-
 
         chrome_thread = threading.Thread(target=chrome_worker, daemon=True)
         chrome_thread.start()
