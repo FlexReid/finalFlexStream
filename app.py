@@ -502,7 +502,7 @@ def capture_first_m3u8(page_url: str, retries=3):
                                             with lock:
                                                 result["headers"] = hdrs
                                             debug(f"[Chrome] generate.php request headers captured: {hdrs}")
-                                    if ".m3u8" in url:
+                                    if "master" in url:
                                         candidate_url = url
                                         candidate_time = time.time()
                                         debug(f"[Chrome] Candidate m3u8: {url} (doc={doc_url}, win={handle[-6:]})")
