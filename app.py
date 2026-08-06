@@ -360,6 +360,21 @@ def capture_first_m3u8(page_url: str, retries=3):
             options.add_argument("--disable-background-networking")
             options.add_argument("--disable-default-apps")
             options.add_argument("--mute-audio")
+            # Cross-origin iframes normally run in a separate renderer
+            # process ("Site Isolation" / OOPIFs). Network.enable + the
+            # performance log via Selenium is scoped to the top-level CDP
+            # target it's attached to, and does NOT automatically pick up
+            # network events from those out-of-process child frames — even
+            # though DevTools' own Network tab (which attaches to every
+            # target) shows them fine. Since the real player now often
+            # lives a couple of iframes deep on a different origin, this is
+            # almost certainly why the master .m3u8 request was invisible
+            # to us while it's clearly visible in DevTools. Disabling site
+            # isolation keeps same-window iframes in the same process/
+            # target as the top page, so their traffic shows up in the same
+            # performance log stream we're already reading.
+            options.add_argument("--disable-site-isolation-trials")
+            options.add_argument("--disable-features=IsolateOrigins,site-per-process")
             options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
             options.page_load_strategy = "eager"
 
@@ -393,24 +408,38 @@ def capture_first_m3u8(page_url: str, retries=3):
                 kwargs["driver_executable_path"] = system_chromedriver
             os.environ.setdefault("DISPLAY", ":0")
             driver = None
-            try:
-                driver = uc.Chrome(**kwargs)
-                debug("[Chrome] Browser launched")
+
+            # get_log("performance") is scoped to whichever window/tab is
+            # currently focused, so a popup (a new window handle) needs its
+            # own Network.enable/setBlockedURLs call and its own polling
+            # pass — it isn't automatically covered by enabling it on the
+            # original tab.
+            enabled_handles = set()
+
+            def enable_network(handle):
+                if handle in enabled_handles:
+                    return
                 try:
                     driver.execute_cdp_cmd("Network.enable", {})
-                except Exception:
-                    pass
+                except Exception as e:
+                    debug(f"[Chrome] Network.enable failed for window {handle}: {e}")
                 try:
                     driver.execute_cdp_cmd(
                         "Network.setBlockedURLs",
                         {"urls": [f"*{name}*" for name in BLOCKED_SCRIPT_PATTERNS]},
                     )
-                    debug(f"[Chrome] Blocking scripts: {BLOCKED_SCRIPT_PATTERNS}")
                 except Exception as e:
-                    debug(f"[Chrome] Could not set blocked URLs: {e}")
+                    debug(f"[Chrome] setBlockedURLs failed for window {handle}: {e}")
+                enabled_handles.add(handle)
+                debug(f"[Chrome] Network monitoring enabled for window {handle}")
+
+            try:
+                driver = uc.Chrome(**kwargs)
+                debug("[Chrome] Browser launched (site isolation disabled)")
+                enable_network(driver.current_window_handle)
                 driver.get(page_url)
                 try:
-                    driver.get_log("performance")
+                    driver.get_log("performance")  # drain the initial burst before we start diffing
                 except Exception:
                     pass
                 click_play_chrome(driver)
@@ -419,47 +448,82 @@ def capture_first_m3u8(page_url: str, retries=3):
                 candidate_url = None
                 candidate_time = None
                 seen_response_ids = set()
+                seen_request_urls = set()  # dedupes the diagnostic per-request log line, not capture logic
+                known_handles = set(driver.window_handles)
+
                 while time.time() < deadline:
                     if done.is_set():
                         break
+
                     try:
-                        logs = driver.get_log("performance")
+                        current_handles = driver.window_handles
                     except Exception:
-                        break
-                    for entry in logs:
+                        current_handles = list(known_handles)
+                    for h in current_handles:
+                        if h not in known_handles:
+                            debug(f"[Chrome] New window/tab/popup detected: {h}")
+                            known_handles.add(h)
+
+                    for handle in list(known_handles):
+                        if handle not in current_handles:
+                            known_handles.discard(handle)
+                            enabled_handles.discard(handle)
+                            continue
                         try:
-                            msg = json.loads(entry["message"])["message"]
-                            method = msg.get("method")
-                            if method == "Network.requestWillBeSent":
-                                req = msg["params"]["request"]
-                                url = req.get("url", "")
-                                if TOKEN_SOURCE_HINT in url:
-                                    hdrs = _headers_from_cdp_request(req.get("headers", {}))
-                                    if hdrs.get("Origin") or hdrs.get("Referer"):
-                                        with lock:
-                                            result["headers"] = hdrs
-                                        debug(f"[Chrome] generate.php request headers captured: {hdrs}")
-                                if ".m3u8" in url:
-                                    candidate_url = url
-                                    candidate_time = time.time()
-                                    debug(f"[Chrome] Candidate m3u8: {url}")
-                            elif method == "Network.responseReceived":
-                                resp = msg["params"]["response"]
-                                if TOKEN_SOURCE_HINT in resp.get("url", ""):
-                                    request_id = msg["params"]["requestId"]
-                                    if request_id not in seen_response_ids:
-                                        seen_response_ids.add(request_id)
-                                        try:
-                                            body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
-                                            token = _extract_token_from_text(body.get("body", ""))
-                                            if token:
-                                                with lock:
-                                                    result["token"] = token
-                                                debug("[Chrome] Extracted token from generate.php response")
-                                        except Exception as body_err:
-                                            debug(f"[Chrome] Could not read generate.php response body: {body_err}")
+                            driver.switch_to.window(handle)
                         except Exception:
                             continue
+                        enable_network(handle)
+                        try:
+                            logs = driver.get_log("performance")
+                        except Exception:
+                            continue
+                        for entry in logs:
+                            try:
+                                msg = json.loads(entry["message"])["message"]
+                                method = msg.get("method")
+                                if method == "Network.requestWillBeSent":
+                                    req = msg["params"]["request"]
+                                    url = req.get("url", "")
+                                    doc_url = msg["params"].get("documentURL", "")
+                                    # Every request we actually see, logged
+                                    # once each — this is the diagnostic
+                                    # trail: compare it against what
+                                    # DevTools' Network tab shows to see
+                                    # exactly which requests we're (still)
+                                    # missing versus which ones we catch but
+                                    # aren't recognizing as the master.
+                                    if url not in seen_request_urls:
+                                        seen_request_urls.add(url)
+                                        debug(f"[Chrome][req win={handle[-6:]}] doc={doc_url} url={url}")
+                                    if TOKEN_SOURCE_HINT in url:
+                                        hdrs = _headers_from_cdp_request(req.get("headers", {}))
+                                        if hdrs.get("Origin") or hdrs.get("Referer"):
+                                            with lock:
+                                                result["headers"] = hdrs
+                                            debug(f"[Chrome] generate.php request headers captured: {hdrs}")
+                                    if ".m3u8" in url:
+                                        candidate_url = url
+                                        candidate_time = time.time()
+                                        debug(f"[Chrome] Candidate m3u8: {url} (doc={doc_url}, win={handle[-6:]})")
+                                elif method == "Network.responseReceived":
+                                    resp = msg["params"]["response"]
+                                    if TOKEN_SOURCE_HINT in resp.get("url", ""):
+                                        request_id = msg["params"]["requestId"]
+                                        if request_id not in seen_response_ids:
+                                            seen_response_ids.add(request_id)
+                                            try:
+                                                body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
+                                                token = _extract_token_from_text(body.get("body", ""))
+                                                if token:
+                                                    with lock:
+                                                        result["token"] = token
+                                                    debug("[Chrome] Extracted token from generate.php response")
+                                            except Exception as body_err:
+                                                debug(f"[Chrome] Could not read generate.php response body: {body_err}")
+                            except Exception:
+                                continue
+
                     if candidate_url and (time.time() - candidate_time) >= DEBOUNCE_SECONDS:
                         with lock:
                             if not result["url"]:
