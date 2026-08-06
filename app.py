@@ -4,7 +4,6 @@ import time
 import requests
 from flask import Flask, request, Response, render_template_string, jsonify
 from urllib.parse import urljoin, quote_plus, unquote_plus, urlparse, urlunparse, parse_qs, urlencode
-from playwright.sync_api import sync_playwright
 from rapidfuzz import process, fuzz
 import os
 import datetime
@@ -503,9 +502,17 @@ def capture_first_m3u8(page_url: str, retries=3):
                                                 result["headers"] = hdrs
                                             debug(f"[Chrome] generate.php request headers captured: {hdrs}")
                                     if "master" in url:
-                                        candidate_url = url
-                                        candidate_time = time.time()
-                                        debug(f"[Chrome] Candidate m3u8: {url} (doc={doc_url}, win={handle[-6:]})")
+                                        if url != candidate_url:
+                                            candidate_url = url
+                                            candidate_time = time.time()
+                                            debug(f"[Chrome] Candidate m3u8: {url} (doc={doc_url}, win={handle[-6:]})")
+                                        # else: the same URL being requested again (e.g. the
+                                        # player periodically re-polling/refreshing the master
+                                        # manifest) — not a newer URL superseding this one, so
+                                        # don't reset the debounce timer. Resetting it here was
+                                        # exactly why capture never settled: once playback
+                                        # started polling the manifest, a new "reset" arrived
+                                        # faster than DEBOUNCE_SECONDS could ever elapse.
                                 elif method == "Network.responseReceived":
                                     resp = msg["params"]["response"]
                                     if TOKEN_SOURCE_HINT in resp.get("url", ""):
@@ -545,120 +552,7 @@ def capture_first_m3u8(page_url: str, retries=3):
                     chrome_failed.set()
                     done.set()
 
-        chrome_thread = threading.Thread(target=chrome_worker, daemon=True)
-        chrome_thread.start()
-        debug("[Playwright] Starting WebKit...")
-
-        try:
-            with sync_playwright() as p:
-                browser = p.webkit.launch(headless=True)
-                context = browser.new_context()
-                page = context.new_page()
-
-                def _block_scripts(route):
-                    url = route.request.url
-                    if any(name in url for name in BLOCKED_SCRIPT_PATTERNS):
-                        debug(f"[Playwright] Blocking script: {url}")
-                        route.abort()
-                    else:
-                        route.continue_()
-
-                page.route("**/*", _block_scripts)
-
-                pw_candidate = {"url": None, "time": None}
-
-                def on_request(req):
-                    url = req.url
-                    if TOKEN_SOURCE_HINT in url:
-                        try:
-                            hdrs = req.headers
-                        except Exception:
-                            hdrs = {}
-                        origin = hdrs.get("origin")
-                        referer = hdrs.get("referer")
-                        if origin or referer:
-                            with lock:
-                                result["headers"] = {"Origin": origin, "Referer": referer}
-                            debug(f"[Playwright] generate.php request headers captured: Origin={origin} Referer={referer}")
-                    if ".m3u8" in url:
-                        with lock:
-                            pw_candidate["url"] = url
-                            pw_candidate["time"] = time.time()
-                        debug(f"[Playwright] Candidate m3u8: {url}")
-
-                def on_response(resp):
-                    if TOKEN_SOURCE_HINT in resp.url:
-                        try:
-                            text = resp.text()
-                        except Exception:
-                            text = None
-                        token = _extract_token_from_text(text)
-                        if token:
-                            with lock:
-                                result["token"] = token
-                            debug("[Playwright] Extracted token from generate.php response")
-
-                page.on("request", on_request)
-                page.on("response", on_response)
-                try:
-                    page.goto(page_url, wait_until="load", timeout=30000)
-                except Exception as e:
-                    debug(f"[Playwright] Page load error: {e}")
-
-                # The player's DOM is often inside a nested iframe now that
-                # we load the embed page directly, so search every frame
-                # (not just the main page) for something clickable. Retry
-                # for a few seconds too — the player often isn't fully
-                # initialized right when 'load' fires, especially now that
-                # some of its bootstrap scripts are blocked.
-                clicked = False
-                for _ in range(8):
-                    for frame in page.frames:
-                        for sel in PLAY_SELECTORS:
-                            try:
-                                el = frame.query_selector(sel)
-                                if el:
-                                    el.click()
-                                    clicked = True
-                                    break
-                            except Exception:
-                                continue
-                        if clicked:
-                            break
-                    if clicked:
-                        break
-                    page.wait_for_timeout(400)
-                if not clicked:
-                    try:
-                        page.mouse.click(640, 360)
-                    except Exception:
-                        pass
-
-                for _ in range(120):
-                    if done.is_set():
-                        break
-                    with lock:
-                        cand_url, cand_time = pw_candidate["url"], pw_candidate["time"]
-                    if cand_url and not result["url"] and cand_time and (time.time() - cand_time) >= DEBOUNCE_SECONDS:
-                        with lock:
-                            if not result["url"]:
-                                result["url"] = cand_url
-                                debug(f"[Playwright] Captured m3u8 (settled after debounce): {cand_url}")
-                        done.set()
-                        break
-                    page.wait_for_timeout(500)
-
-                context.close()
-                browser.close()
-
-        except Exception as e:
-            debug(f"[Playwright] Fatal error: {e}")
-
-        if not done.is_set():
-            debug("Waiting for Chrome thread to finish...")
-            done.wait(timeout=120)
-
-        chrome_thread.join(timeout=5)
+        chrome_worker()
 
         if chrome_failed.is_set() and not result["url"]:
             return None, {}, None
