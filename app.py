@@ -77,10 +77,20 @@ def get_headers_for_stream(url: str) -> dict:
         stored = _stream_headers.get(host)
     if stored and (stored.get("Origin") or stored.get("Referer")):
         h = {"User-Agent": "Mozilla/5.0"}
-        if stored.get("Origin"):
+        referer = stored.get("Referer")
+        if referer:
+            h["Referer"] = referer
+            # The Origin header must agree with the Referer's own origin —
+            # CDNs that validate Origin/Referer together treat a mismatch
+            # between them as a bot signal and silently zero the response,
+            # which is indistinguishable from a normal empty body. Derive
+            # Origin from the Referer (scheme://host, no path/trailing
+            # slash — Origin never carries one) instead of trusting
+            # whatever separate Origin value happened to be captured, since
+            # the Referer is the more reliably-correct of the two.
+            h["Origin"] = _origin_from_url(referer)
+        elif stored.get("Origin"):
             h["Origin"] = stored["Origin"]
-        if stored.get("Referer"):
-            h["Referer"] = stored["Referer"]
         return h
     origin = _current_origin["value"] or "https://cloudorchestranova.com"
     return {
