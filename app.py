@@ -1364,9 +1364,9 @@ def get_m3u8():
         return "", 404
 
     if type_ == "tv" and season and episode:
-        vsrc_embed = f"https://vidsrc.sh/embed/tv?imdb={imdb_id}&season={season}&episode={episode}&dts=dd"
+        vsrc_embed = f"https://vidsrc.sh/embed/tv/{imdb_id}/{season}/{episode}"
     else:
-        vsrc_embed = f"https://vidsrc.sh/embed/movie?imdb={imdb_id}&dts=dd"
+        vsrc_embed = f"https://vidsrc.sh/embed/movie/{imdb_id}"
 
     # Loads vsrc_embed directly in the browser — no more manually fetching
     # the embed page over plain HTTP and regexing the iframe out of it
@@ -1543,7 +1543,7 @@ def _resolve_tv_episode_stream(tmdb_id: int, season: int, episode: int):
     imdb_id = external_resp.get("imdb_id")
     if not imdb_id:
         return None, None
-    vsrc_embed = f"https://vidsrc.sh/embed/tv?imdb={imdb_id}&season={season}&episode={episode}&dts=dd"
+    vsrc_embed = f"https://vidsrc.sh/embed/tv/{imdb_id}/{season}/{episode}"
     return capture_first_m3u8(vsrc_embed, retries=3)
 
 
